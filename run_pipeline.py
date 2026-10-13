@@ -307,15 +307,15 @@ def run_full_pipeline(args, cfg: dict):
 
     # Step 4: Downstream Benchmark (nếu yêu cầu qua cờ --run_benchmark)
     benchmark_results = None
+    aug_yaml_path = out / "filtered" / "augmented_dataset.yaml"
     if getattr(args, "run_benchmark", False):
-        setattr(args, "models", getattr(args, "benchmark_models", ["yolo11", "yolov8", "yolov9", "rtdetr"]))
+        setattr(args, "models", getattr(args, "benchmark_models", ["yolo11"]))
         setattr(args, "epochs", getattr(args, "benchmark_epochs", 100))
         setattr(args, "aug_yaml", str(aug_yaml_path))
         benchmark_results = run_step4(args, cfg)
 
     # Tổng kết
     elapsed = time.time() - t_start
-    aug_yaml_path = out / "filtered" / "augmented_dataset.yaml"
     logger.info("=" * 60)
     logger.info("🎉 PIPELINE HOÀN TẤT")
     logger.info(f"   Tổng thời gian: {elapsed/60:.1f} phút")
@@ -351,7 +351,7 @@ def run_step4(args, cfg: dict) -> dict:
     from pcb_pipeline.step4_benchmark import DownstreamBenchmarker
 
     logger.info("=" * 60)
-    logger.info("STEP 4 — Downstream Benchmark (YOLOv8, YOLOv9, YOLO11, RT-DETR)")
+    logger.info("STEP 4 — Downstream Benchmark (YOLO11)")
     logger.info("=" * 60)
 
     out_base = Path(args.output_dir)
@@ -366,9 +366,12 @@ def run_step4(args, cfg: dict) -> dict:
         candidate = out_base / "filtered" / "augmented_dataset.yaml"
         aug_yaml = str(candidate) if candidate.exists() else "outputs/pcb_synthesis/filtered/augmented_dataset.yaml"
 
-    models = getattr(args, "models", None) or ["yolo11", "yolov8", "yolov9", "rtdetr"]
+    models = getattr(args, "models", None) or ["yolo11"]
     epochs = getattr(args, "epochs", None) or cfg.get("benchmark_epochs", 100)
-    batch_size = getattr(args, "batch_size", None) or cfg.get("benchmark_batch", 16)
+    batch_size = getattr(args, "batch_size", None) or cfg.get("benchmark_batch", 8)
+    lr0 = getattr(args, "lr0", None) or cfg.get("benchmark_lr0", 1e-4)
+    conf = getattr(args, "conf", None) or cfg.get("benchmark_conf", 0.25)
+    iou = getattr(args, "iou", None) or cfg.get("benchmark_iou", 0.25)
     imgsz = getattr(args, "imgsz", 600)
 
     benchmarker = DownstreamBenchmarker(
@@ -377,6 +380,9 @@ def run_step4(args, cfg: dict) -> dict:
         epochs=epochs,
         batch_size=batch_size,
         imgsz=imgsz,
+        lr0=lr0,
+        conf_thresh=conf,
+        iou_thresh=iou,
     )
     results = benchmarker.run_benchmark(
         models=models,
@@ -437,7 +443,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_full.add_argument("--reject_ratio",    type=float, default=None)
     p_full.add_argument("--by_class",        action="store_true", help="Lọc độc lập theo từng loại lỗi để cân bằng class")
     p_full.add_argument("--run_benchmark",    action="store_true", help="Tự động chạy Step 4 Benchmark sau khi hoàn tất Step 3")
-    p_full.add_argument("--benchmark_models", nargs="+", default=["yolo11", "yolov8", "yolov9", "rtdetr"], help="Danh sách mô hình benchmark khi chạy full")
+    p_full.add_argument("--benchmark_models", nargs="+", default=["yolo11"], help="Danh sách mô hình benchmark khi chạy full (mặc định: yolo11)")
     p_full.add_argument("--benchmark_epochs", type=int, default=100, help="Số epochs benchmark cho mỗi model (mặc định 100 theo bài báo)")
 
     # ── step1_train ──────────────────────────────────────
@@ -492,14 +498,17 @@ def build_parser() -> argparse.ArgumentParser:
     p3.add_argument("--by_class",            action="store_true")
 
     # ── step4 ────────────────────────────────────────────
-    p4 = subparsers.add_parser("step4", help="Chỉ chạy Step 4: Downstream Benchmark (YOLOv8, YOLOv9, YOLO11, RT-DETR)")
+    p4 = subparsers.add_parser("step4", help="Chỉ chạy Step 4: Downstream Benchmark (mặc định: yolo11)")
     add_common(p4)
-    p4.add_argument("--models",              nargs="+", default=["yolo11", "yolov8", "yolov9", "rtdetr"], help="Danh sách mô hình benchmark")
+    p4.add_argument("--models",              nargs="+", default=["yolo11"], help="Danh sách mô hình benchmark (mặc định: yolo11)")
     p4.add_argument("--split",               choices=["id", "npi"], default="id", help="Kịch bản đánh giá: 'id' (Table 3) hoặc 'npi' (Table 6)")
     p4.add_argument("--base_yaml",           default=None, help="Dataset YAML baseline (data/id_setup.yaml hoặc data/npi_setup.yaml)")
     p4.add_argument("--aug_yaml",            default=None, help="Dataset YAML augmented từ Step 3")
     p4.add_argument("--epochs",              type=int, default=100, help="Số epochs huấn luyện (mặc định 100 theo bài báo)")
-    p4.add_argument("--batch_size",          type=int, default=16, help="Batch size huấn luyện (mặc định 16)")
+    p4.add_argument("--batch_size",          type=int, default=8, help="Batch size huấn luyện (mặc định 8 theo bài báo)")
+    p4.add_argument("--lr0",                 type=float, default=1e-4, help="Learning rate AdamW (mặc định 1e-4 theo bài báo)")
+    p4.add_argument("--conf",                type=float, default=0.25, help="Confidence threshold đánh giá Precision/Recall (mặc định 0.25 theo bài báo)")
+    p4.add_argument("--iou",                 type=float, default=0.25, help="IoU threshold đánh giá Precision/Recall (mặc định 0.25 theo bài báo)")
     p4.add_argument("--imgsz",               type=int, default=600, help="Kích thước ảnh đầu vào (mặc định 600)")
 
     return parser
