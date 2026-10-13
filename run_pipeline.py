@@ -305,6 +305,14 @@ def run_full_pipeline(args, cfg: dict):
     # Step 3: Quality Filtering
     final_records = run_step3(gen_records, args, cfg)
 
+    # Step 4: Downstream Benchmark (nếu yêu cầu qua cờ --run_benchmark)
+    benchmark_results = None
+    if getattr(args, "run_benchmark", False):
+        setattr(args, "models", getattr(args, "benchmark_models", ["yolo11", "yolov8", "yolov9", "rtdetr"]))
+        setattr(args, "epochs", getattr(args, "benchmark_epochs", 100))
+        setattr(args, "aug_yaml", str(aug_yaml_path))
+        benchmark_results = run_step4(args, cfg)
+
     # Tổng kết
     elapsed = time.time() - t_start
     aug_yaml_path = out / "filtered" / "augmented_dataset.yaml"
@@ -314,23 +322,71 @@ def run_full_pipeline(args, cfg: dict):
     logger.info(f"   Ảnh sau lọc:   {len(final_records)}")
     if aug_yaml_path.exists():
         logger.info(f"   Augmented YAML: {aug_yaml_path.resolve()}")
+    if benchmark_results:
+        logger.info(f"   Benchmark Dir:  {(out / 'benchmark').resolve()}")
     logger.info(f"   Output:        {out.resolve()}")
     logger.info("=" * 60)
 
     # Lưu report
     report = {
-        "total_masks":      len(mask_records),
-        "total_generated":  len(gen_records),
-        "total_accepted":   len(final_records),
-        "rejected_ratio":   cfg["reject_ratio"],
-        "augmented_yaml":   str(aug_yaml_path.resolve()) if aug_yaml_path.exists() else None,
-        "elapsed_minutes":  round(elapsed / 60, 1),
-        "config":           cfg,
+        "total_masks":        len(mask_records),
+        "total_generated":    len(gen_records),
+        "total_accepted":     len(final_records),
+        "rejected_ratio":     cfg["reject_ratio"],
+        "augmented_yaml":     str(aug_yaml_path.resolve()) if aug_yaml_path.exists() else None,
+        "benchmark_executed": bool(benchmark_results),
+        "elapsed_minutes":    round(elapsed / 60, 1),
+        "config":             cfg,
     }
     (out / "pipeline_report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     return final_records
+
+
+# ─────────────────────────────────────────────────────────
+# STEP 4: Downstream Benchmark
+# ─────────────────────────────────────────────────────────
+def run_step4(args, cfg: dict) -> dict:
+    from pcb_pipeline.step4_benchmark import DownstreamBenchmarker
+
+    logger.info("=" * 60)
+    logger.info("STEP 4 — Downstream Benchmark (YOLOv8, YOLOv9, YOLO11, RT-DETR)")
+    logger.info("=" * 60)
+
+    out_base = Path(args.output_dir)
+    bench_out = out_base if out_base.name == "benchmark" else out_base / "benchmark"
+    split_name = getattr(args, "split", "id")
+    base_yaml = getattr(args, "base_yaml", None)
+    if not base_yaml:
+        base_yaml = "data/id_setup.yaml" if split_name == "id" else "data/npi_setup.yaml"
+
+    aug_yaml = getattr(args, "aug_yaml", None)
+    if not aug_yaml:
+        candidate = out_base / "filtered" / "augmented_dataset.yaml"
+        aug_yaml = str(candidate) if candidate.exists() else "outputs/pcb_synthesis/filtered/augmented_dataset.yaml"
+
+    models = getattr(args, "models", None) or ["yolo11", "yolov8", "yolov9", "rtdetr"]
+    epochs = getattr(args, "epochs", None) or cfg.get("benchmark_epochs", 100)
+    batch_size = getattr(args, "batch_size", None) or cfg.get("benchmark_batch", 16)
+    imgsz = getattr(args, "imgsz", 600)
+
+    benchmarker = DownstreamBenchmarker(
+        output_dir=bench_out,
+        device=cfg["device"],
+        epochs=epochs,
+        batch_size=batch_size,
+        imgsz=imgsz,
+    )
+    results = benchmarker.run_benchmark(
+        models=models,
+        base_yaml=base_yaml,
+        aug_yaml=aug_yaml,
+        split_name=split_name,
+        epochs=epochs,
+        batch_size=batch_size,
+    )
+    return results
 
 
 # ─────────────────────────────────────────────────────────
@@ -380,6 +436,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_full.add_argument("--yolo_epochs",     type=int, default=None, help="Số epochs huấn luyện YOLO judge (100 theo bài báo)")
     p_full.add_argument("--reject_ratio",    type=float, default=None)
     p_full.add_argument("--by_class",        action="store_true", help="Lọc độc lập theo từng loại lỗi để cân bằng class")
+    p_full.add_argument("--run_benchmark",    action="store_true", help="Tự động chạy Step 4 Benchmark sau khi hoàn tất Step 3")
+    p_full.add_argument("--benchmark_models", nargs="+", default=["yolo11", "yolov8", "yolov9", "rtdetr"], help="Danh sách mô hình benchmark khi chạy full")
+    p_full.add_argument("--benchmark_epochs", type=int, default=100, help="Số epochs benchmark cho mỗi model (mặc định 100 theo bài báo)")
 
     # ── step1_train ──────────────────────────────────────
     p1t = subparsers.add_parser("step1_train", help="Huấn luyện prediction heads của CAMG")
@@ -432,6 +491,17 @@ def build_parser() -> argparse.ArgumentParser:
     p3.add_argument("--reject_ratio",        type=float, default=None)
     p3.add_argument("--by_class",            action="store_true")
 
+    # ── step4 ────────────────────────────────────────────
+    p4 = subparsers.add_parser("step4", help="Chỉ chạy Step 4: Downstream Benchmark (YOLOv8, YOLOv9, YOLO11, RT-DETR)")
+    add_common(p4)
+    p4.add_argument("--models",              nargs="+", default=["yolo11", "yolov8", "yolov9", "rtdetr"], help="Danh sách mô hình benchmark")
+    p4.add_argument("--split",               choices=["id", "npi"], default="id", help="Kịch bản đánh giá: 'id' (Table 3) hoặc 'npi' (Table 6)")
+    p4.add_argument("--base_yaml",           default=None, help="Dataset YAML baseline (data/id_setup.yaml hoặc data/npi_setup.yaml)")
+    p4.add_argument("--aug_yaml",            default=None, help="Dataset YAML augmented từ Step 3")
+    p4.add_argument("--epochs",              type=int, default=100, help="Số epochs huấn luyện (mặc định 100 theo bài báo)")
+    p4.add_argument("--batch_size",          type=int, default=16, help="Batch size huấn luyện (mặc định 16)")
+    p4.add_argument("--imgsz",               type=int, default=600, help="Kích thước ảnh đầu vào (mặc định 600)")
+
     return parser
 
 
@@ -458,6 +528,7 @@ def main():
             "reject_ratio":      getattr(args, "reject_ratio", None),
             "yolo_size":         getattr(args, "yolo_size", None),
             "yolo_epochs":       getattr(args, "yolo_epochs", None),
+            "benchmark_epochs":  getattr(args, "benchmark_epochs", None),
         },
     )
 
@@ -482,6 +553,9 @@ def main():
         with open(args.gen_meta, encoding="utf-8") as f:
             gen_records = json.load(f)
         run_step3(gen_records, args, cfg)
+
+    elif args.command == "step4":
+        run_step4(args, cfg)
 
 
 if __name__ == "__main__":

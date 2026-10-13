@@ -1,1 +1,6 @@
-# PCB Defect Synthesis Pipeline
+# PCB Defect Synthesis & Benchmark Pipeline
+from pcb_pipeline.data_module import PCBDataModule
+from pcb_pipeline.step1_mask_generator import PCBMaskGenerator, CAMGGenerator, CAMGTrainer
+from pcb_pipeline.step2_lora_inpainting import LoRAInpaintTrainer, PCBDefectInpainter
+from pcb_pipeline.step3_quality_filter import YOLO11DefectTrainer, YOLO11ConfidenceScorer, QualityFilter
+from pcb_pipeline.step4_benchmark import DownstreamBenchmarker

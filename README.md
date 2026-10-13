@@ -128,6 +128,23 @@ python run_pipeline.py step3 \
     --device cuda
 ```
 
+#### Bước 4: Downstream Benchmark (Tái lập Table 3 & 6 của bài báo)
+```bash
+python run_pipeline.py step4 \
+    --models yolo11 yolov8 yolov9 rtdetr \
+    --split id \
+    --base_yaml data/id_setup.yaml \
+    --aug_yaml outputs/pcb_synthesis/filtered/augmented_dataset.yaml \
+    --epochs 100 \
+    --batch_size 16 \
+    --output_dir outputs/benchmark \
+    --device cuda
+```
+> Kết quả so sánh Baseline vs Augmented sẽ tự động xuất ra:
+> - `outputs/benchmark/benchmark_report.md` (Bảng Markdown đối chứng chuẩn bài báo)
+> - `outputs/benchmark/benchmark_comparison.csv` (Bảng số liệu chi tiết)
+> - `outputs/benchmark/benchmark_summary.json` (Dữ liệu số có cấu trúc)
+
 ---
 
 ## 📋 6 loại lỗi PCB chuẩn DeepPCB (Paper Standard)

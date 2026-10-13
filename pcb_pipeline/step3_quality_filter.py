@@ -592,6 +592,7 @@ class QualityFilter:
         aug_yaml_path = output_dir / "augmented_dataset.yaml"
         aug_yaml_content = (
             f"# Augmented PCB Defect Dataset (Real 10% + Top 75% Accepted Synthetic)\n"
+            f"path: .\n"
             f"train: {str(aug_train_txt.resolve()).replace('\\', '/')}\n"
             f"val: {val_img_source}\n\n"
             f"nc: 6\n"
