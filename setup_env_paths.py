@@ -35,6 +35,24 @@ def adapt_paths(project_root: Path = None, mode: str = "relative"):
     print(f"📂 Thư mục gốc dự án: {project_root}")
     print("=" * 60)
 
+    # Kiểm tra xem dataset gốc đã được tải về hay chưa
+    if not raw_dataset_dir.exists():
+        print(f"⚠️ Chưa tìm thấy thư mục: {raw_dataset_dir}")
+        print("👉 Vui lòng tải dataset và giải nén vào thư mục: data/pcb-defect-dataset/")
+    else:
+        # Tự động kiểm tra và sinh 799 ảnh normal sạch nếu chưa có
+        normal_dir = data_dir / "pcb_normal"
+        normals = list(normal_dir.glob("*.jpg")) + list(normal_dir.glob("*.png")) if normal_dir.exists() else []
+        if len(normals) < 100:
+            print("🔄 Phát hiện chưa có thư mục data/pcb_normal (799 ảnh phôi sạch).")
+            print("   Đang tự động khởi chạy data_module để sinh 799 ảnh normal theo chuẩn bài báo...")
+            try:
+                from pcb_pipeline.data_module import PCBDataModule
+                dm = PCBDataModule(raw_dataset_dir=raw_dataset_dir, output_dir=data_dir)
+                dm.run_pipeline()
+            except Exception as e:
+                print(f"⚠️ Lỗi khi tự động chạy data_module: {e}")
+
     # 1. Chuẩn hóa các file .txt trong data/prepared_splits/
     txt_files = list(splits_dir.glob("*.txt"))
     for txt_file in txt_files:

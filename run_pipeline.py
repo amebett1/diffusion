@@ -128,6 +128,20 @@ def run_step1(args, cfg: dict) -> list[dict]:
     weights_path = getattr(args, "camg_weights", None)
     k = getattr(args, "k", 5)
 
+    img_dir = Path(args.image_dir)
+    if not img_dir.exists() or len(list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))) == 0:
+        raw_dir = Path("data/pcb-defect-dataset")
+        if raw_dir.exists():
+            logger.info(f"🔄 Không tìm thấy ảnh sạch trong '{img_dir}'. Tự động tạo 799 ảnh normal từ {raw_dir}...")
+            from pcb_pipeline.data_module import PCBDataModule
+            dm = PCBDataModule(raw_dataset_dir=raw_dir, output_dir="data")
+            dm.run_pipeline()
+        else:
+            raise FileNotFoundError(
+                f"❌ Không tìm thấy thư mục ảnh sạch '{img_dir}' và cũng không tìm thấy '{raw_dir}'.\n"
+                f"👉 Hãy tải dataset và giải nén vào 'data/pcb-defect-dataset/', sau đó chạy 'python run_pipeline.py prepare_data'!"
+            )
+
     gen = CAMGGenerator(
         weights_path=weights_path,
         device=cfg["device"],
@@ -292,6 +306,21 @@ def run_full_pipeline(args, cfg: dict):
     logger.info(f"   Output: {out.resolve()}")
     t_start = time.time()
 
+    # Tự động kiểm tra ảnh sạch pcb_normal
+    img_dir = Path(args.image_dir)
+    if not img_dir.exists() or len(list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))) == 0:
+        raw_dir = Path("data/pcb-defect-dataset")
+        if raw_dir.exists():
+            logger.info(f"🔄 Chưa tìm thấy ảnh sạch trong '{img_dir}'. Đang tự động tạo 799 ảnh normal theo chuẩn bài báo...")
+            from pcb_pipeline.data_module import PCBDataModule
+            dm = PCBDataModule(raw_dataset_dir=raw_dir, output_dir="data")
+            dm.run_pipeline()
+        else:
+            raise FileNotFoundError(
+                f"❌ Không tìm thấy thư mục '{img_dir}' và cũng không tìm thấy '{raw_dir}'.\n"
+                f"👉 Hãy tải dataset và giải nén vào 'data/pcb-defect-dataset/', sau đó chạy 'python run_pipeline.py prepare_data'!"
+            )
+
     # Step 1: Mask Generation
     mask_records = run_step1(args, cfg)
 
@@ -395,6 +424,26 @@ def run_step4(args, cfg: dict) -> dict:
     return results
 
 
+def run_prepare_data(args, cfg: dict):
+    from pcb_pipeline.data_module import PCBDataModule
+    from setup_env_paths import adapt_paths
+
+    raw_dir = Path(args.raw_dir)
+    out_dir = Path(args.output_dir)
+    if not raw_dir.exists():
+        raise FileNotFoundError(
+            f"❌ Không tìm thấy thư mục dataset gốc: '{raw_dir}'.\n"
+            f"👉 Vui lòng tải dataset và giải nén vào đúng thư mục '{raw_dir}' rồi thử lại!"
+        )
+    logger.info("=" * 60)
+    logger.info("PREPARE DATA — Phân chia ID/NPI splits & Tạo 799 ảnh phôi sạch pcb_normal")
+    logger.info("=" * 60)
+    dm = PCBDataModule(raw_dataset_dir=raw_dir, output_dir=out_dir)
+    dm.run_pipeline()
+    adapt_paths(mode="relative")
+    logger.info("✅ Dữ liệu đã sẵn sàng để chạy pipeline!")
+
+
 # ─────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────
@@ -414,8 +463,13 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--config",           default=None, help="JSON config file")
         p.add_argument("--defect_types",     nargs="+", default=None)
 
+    # ── prepare_data ─────────────────────────────────────
+    p_prep = subparsers.add_parser("prepare_data", help="Tiền xử lý dataset: tạo ID/NPI splits và sinh 799 ảnh phôi sạch pcb_normal")
+    p_prep.add_argument("--raw_dir",    default="data/pcb-defect-dataset", help="Thư mục dataset gốc đã tải về")
+    p_prep.add_argument("--output_dir", default="data", help="Thư mục lưu cấu hình và ảnh normal")
+
     # ── full ─────────────────────────────────────────────
-    p_full = subparsers.add_parser("full", help="Chạy toàn bộ 3 bước pipeline")
+    p_full = subparsers.add_parser("full", help="Chạy toàn bộ pipeline")
     add_common(p_full)
     p_full.add_argument("--image_dir",       required=True,  help="Thư mục ảnh PCB không lỗi")
     p_full.add_argument("--real_defect_dir", default=None,   help="Thư mục ảnh lỗi thực (để train LoRA+YOLO)")
@@ -521,7 +575,7 @@ def main():
     cfg = load_config(
         getattr(args, "config", None),
         {
-            "device":            args.device,
+            "device":            getattr(args, "device", "cuda"),
             "mask_strategy":     getattr(args, "mask_strategy", None),
             "images_per_defect": getattr(args, "images_per_defect", None),
             "lora_rank":         getattr(args, "lora_rank", None),
@@ -565,6 +619,9 @@ def main():
 
     elif args.command == "step4":
         run_step4(args, cfg)
+
+    elif args.command == "prepare_data":
+        run_prepare_data(args, cfg)
 
 
 if __name__ == "__main__":

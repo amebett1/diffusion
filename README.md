@@ -46,36 +46,70 @@ pip install -r requirements.txt
 ```
 
 ### 2. Thiết lập dữ liệu (`data/`)
-Do dung lượng ảnh lớn (~1.25 GB, gồm hơn 22.000 file), dữ liệu được chia sẻ riêng qua Google Drive (file `diffusion_colab.zip`):
-- Tải file **`diffusion_colab.zip`** từ Google Drive.
-- Giải nén vào thư mục dự án sao cho cấu trúc như sau:
+Dự án sử dụng tập dữ liệu **DeepPCB (PCB Defect Dataset)**. Người dùng tự tải tập dữ liệu theo đường link được cung cấp:
 
+1. **Tải & Giải nén:** Tải file nén dataset và giải nén vào thư mục `data/pcb-defect-dataset/` sao cho cấu trúc như sau:
 ```text
 data/
-├── pcb-defect-dataset/        # Ảnh và nhãn DeepPCB gốc (train, val, test độ phân giải 600x600)
-├── pcb_normal/                # 799 ảnh phôi PCB sạch không lỗi (tạo bằng Telea Inpainting)
-├── prepared_splits/           # Danh sách file chia tập ID và NPI
-│   ├── id_train_low.txt       # 10% train ID (668 ảnh)
-│   ├── id_val.txt             # Validation ID (1.180 ảnh)
-│   ├── npi_train_low.txt      # Seen products train (668 ảnh)
-│   └── npi_val_unseen.txt     # 100% Unseen products val (2.804 ảnh)
-├── id_setup.yaml              # Cấu hình YOLO kịch bản In-Distribution
-├── npi_setup.yaml             # Cấu hình YOLO kịch bản New Product Introduction
-├── train_metadata.json        # Metadata huấn luyện CAMG và LoRA
-└── dataset_stats.json         # Thống kê phân vị Q1/Q3 kích thước khuyết tật
+└── pcb-defect-dataset/
+    ├── train/
+    │   ├── images/
+    │   └── labels/
+    ├── val/
+    │   ├── images/
+    │   └── labels/
+    └── test/
+        ├── images/
+        └── labels/
 ```
 
-> **Lưu ý về tính di động (Portability):** Toàn bộ cấu hình và file txt đều sử dụng **đường dẫn tương đối chuẩn (`data/...`)**, cho phép dự án chạy mượt mà trên bất kỳ máy tính nào (Windows, macOS, Linux, Google Colab) mà không bao giờ gặp lỗi đường dẫn tuyệt đối!
+2. **Chạy tiền xử lý dữ liệu tự động (Tạo ID/NPI splits & sinh 799 ảnh phôi sạch `pcb_normal/`):**
+```bash
+python run_pipeline.py prepare_data
+# Hoặc chạy: python pcb_pipeline/data_module.py && python setup_env_paths.py
+```
+
+> **Cơ chế tự động hóa:** Lệnh trên chỉ mất vài giây để:
+> - Phân chia kịch bản **In-Distribution (ID - 10% Low-Data)** và **New Product Introduction (NPI - Unseen Boards)** theo đúng bài báo.
+> - Tính toán thống kê kích thước Bounding Box ($Q_1, Q_3$) cho loss function.
+> - Tự động áp dụng thuật toán Telea Inpainting để xóa sạch khuyết tật trên các bo mạch đại diện, tạo ra **799 ảnh phôi sạch chuẩn 600x600** trong thư mục `data/pcb_normal/`.
+> - Chuẩn hóa toàn bộ đường dẫn tương đối để chạy được ngay trên bất kỳ máy tính nào (Windows, Linux, Colab) mà không bao giờ bị lỗi đường dẫn!
 
 ---
 
 ## 🚀 Cách chạy Pipeline
 
 ### Cách 1: Chạy trực tiếp trên Google Colab với GPU (Khuyên dùng)
-Dự án đã tích hợp sẵn notebook [run_on_colab.ipynb](run_on_colab.ipynb):
-1. Tải `diffusion_colab.zip` lên Google Drive của bạn.
-2. Mở file `run_on_colab.ipynb` trên Google Colab, kết nối GPU (T4 hoặc A100).
-3. Bấm **Run all** để tự động giải nén, huấn luyện liên hoàn từ Step 1 đến Step 4 và lưu kết quả về Google Drive!
+
+Dự án đã tích hợp sẵn notebook [`run_on_colab.ipynb`](run_on_colab.ipynb). Bạn có thể mở trực tiếp bằng 1 cú click:
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/amebett1/diffusion/blob/main/run_on_colab.ipynb)
+
+#### 📝 Hướng dẫn từng bước thao tác trên Google Colab:
+1. **Mở Notebook:**
+   - Bấm vào nút **Open In Colab** ở trên, hoặc truy cập [Google Colab](https://colab.research.google.com/) $\rightarrow$ Chọn thẻ **GitHub** $\rightarrow$ Nhập `https://github.com/amebett1/diffusion` $\rightarrow$ Chọn file `run_on_colab.ipynb`.
+2. **Bật GPU T4:**
+   - Trên thanh menu trên cùng của Colab: Chọn **Runtime** (Thời lượng) $\rightarrow$ **Change runtime type** (Thay đổi loại phần cứng).
+   - Tại mục **Hardware accelerator**, chọn **T4 GPU** $\rightarrow$ Bấm **Save (Lưu)**.
+3. **Cung cấp link tải Dataset (Tại Bước 1 trong notebook):**
+   - Tìm đến ô code **Bước 1 (Clone Mã Nguồn từ GitHub & Chuẩn bị Dataset)**.
+   - Dán đường link tải dataset do tác giả gửi vào biến:
+     ```python
+     DATASET_LINK = "https://link-tai-dataset-cua-ban"
+     ```
+   - *(Nếu lưu file zip trên Drive cá nhân, bạn có thể mount Google Drive và giải nén như hướng dẫn trong ô code)*.
+4. **Bấm chạy toàn bộ (Run all):**
+   - Trên thanh menu của Colab, chọn **Runtime** $\rightarrow$ Bấm **Run all** (hoặc bấm tổ hợp phím tắt **`Ctrl + F9`** trên Windows / **`Cmd + F9`** trên Mac).
+   - *(Hoặc bạn có thể bấm nút Play ▶️ ở bên trái từng ô code theo thứ tự từ trên xuống dưới)*.
+
+#### ⚙️ Quá trình tự động diễn ra sau khi bấm Run all:
+- **Bước 1**: Tự động clone code từ GitHub và tải/giải nén dataset vào `data/pcb-defect-dataset/`.
+- **Bước 2**: Tự động cài đặt đầy đủ các thư viện (`diffusers`, `ultralytics`, `accelerate`,...).
+- **Bước 3**: Tự động phân chia ID/NPI splits và sinh 799 ảnh phôi sạch (`data/pcb_normal/`).
+- **Bước 4**: Tự động huấn luyện CAMG (Step 1), LoRA Inpainting (Step 2) và YOLO11 Judge Lọc ảnh (Step 3).
+- **Bước 5**: Tự động huấn luyện và đánh giá đối chứng mô hình YOLO11 (Step 4 Benchmark ~45 phút).
+- **Bước 6**: Tự động hiển thị bảng so sánh chi tiết Precision, Recall, mAP@50 (tái lập Table 3 bài báo) và hiển thị ảnh khuyết tật trực quan.
+- **Bước 7**: Tự động sao lưu toàn bộ kết quả, trọng số tốt nhất (`best.pt`) và ảnh sinh về Google Drive của bạn.
 
 ---
 
@@ -84,7 +118,7 @@ Chạy toàn bộ quá trình sinh ảnh và tự động benchmark:
 ```bash
 python run_pipeline.py full \
     --image_dir data/pcb_normal \
-    --real_defect_dir data/pcb-defect-dataset \
+    --real_defect_dir data/pcb-defect-dataset/train/images \
     --metadata_path data/train_metadata.json \
     --data_yaml data/id_setup.yaml \
     --output_dir outputs/pcb_synthesis \
@@ -96,7 +130,7 @@ python run_pipeline.py full \
     --yolo_epochs 100 \
     --reject_ratio 0.25 \
     --run_benchmark \
-    --benchmark_models yolo11 yolov8 yolov9 rtdetr \
+    --benchmark_models yolo11 \
     --benchmark_epochs 100 \
     --device cuda
 ```
