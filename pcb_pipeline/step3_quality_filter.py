@@ -1,363 +1,662 @@
 """
-Step 3: Quality Filtering using YOLO11
-----------------------------------------
-- Train YOLO11 trên ảnh lỗi PCB thực để làm "judge"
-- Đánh giá confidence score cho từng ảnh tổng hợp
-- Loại bỏ 25% ảnh có confidence thấp nhất
+Step 3: Quality Filtering based on Defect Detection Confidence (YOLO11)
+========================================================================
+Triển khai chuẩn theo Mục 3.4 của bài báo:
+"A Synthetic Defect Image Generation Method for Enhanced Industrial
+Defect Detection Based on Inpainting Diffusion and Context-aware Mask Generation"
+(Journal of Intelligent Manufacturing, 2026)
+
+Mục tiêu & Cơ chế kỹ thuật:
+1. Huấn luyện mô hình YOLO11 (Judge Detector) trên tập ảnh lỗi thực tế (10% low-data real split).
+2. Đánh giá chất lượng từng ảnh tổng hợp bằng độ tin cậy phát hiện (Detection Confidence):
+   - Chấm điểm có đối chiếu mục tiêu (Target-aware IoU Matching): Kiểm tra xem YOLO11 có phát hiện
+     đúng lớp khuyết tật mục tiêu (class_id) tại đúng tọa độ bounding box tổng hợp (IoU >= 0.1).
+3. Quy tắc loại bỏ (Rejection Rule):
+   - Loại bỏ k = 25% số lượng ảnh có confidence thấp nhất (hoặc không phát hiện đúng loại lỗi).
+   - Giữ lại 75% ảnh đạt chuẩn chất lượng cao nhất (D_syn, accepted).
+4. Chuẩn hóa & Xuất Dataset cho Downstream Benchmark:
+   - Tự động xuất file nhãn bounding box chuẩn YOLO (.txt: class_id x_c y_c w h).
+   - Tự động kết hợp ảnh lỗi thực (10% low-data) và ảnh tổng hợp accepted thành
+     tập dữ liệu mở rộng D_train, aug (augmented_dataset.yaml).
+5. Cơ chế Dry-run / Heuristic Scorer (No-GPU Fallback):
+   - Khi chạy kiểm thử trên máy cá nhân (chưa có GPU / chưa cài ultralytics), tự động dùng
+     Heuristic Scorer dựa trên năng lượng biên cạnh Sobel và độ tương phản cục bộ của vùng lỗi.
+   - Khi đưa lên Google Colab, tự động kích hoạt toàn bộ sức mạnh GPU và ultralytics.
 """
 
+import os
 import json
-import logging
+import math
 import shutil
+import logging
 from pathlib import Path
-from typing import Optional
+from typing import List, Dict, Tuple, Optional, Union
 
+import cv2
 import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+# Danh sách 6 lớp khuyết tật PCB chuẩn DeepPCB
+PCB_DEFECT_CLASSES = [
+    "mouse_bite",
+    "spur",
+    "missing_hole",
+    "short",
+    "open_circuit",
+    "spurious_copper",
+]
+
+
+def compute_iou(box1: Union[List[float], Tuple[float, ...]], box2: Union[List[float], Tuple[float, ...]]) -> float:
+    """
+    Tính chỉ số Intersection over Union (IoU) giữa 2 bounding boxes dạng [x1, y1, x2, y2].
+    """
+    if len(box1) < 4 or len(box2) < 4:
+        return 0.0
+
+    x1 = max(float(box1[0]), float(box2[0]))
+    y1 = max(float(box1[1]), float(box2[1]))
+    x2 = min(float(box1[2]), float(box2[2]))
+    y2 = min(float(box1[3]), float(box2[3]))
+
+    inter_w = max(0.0, x2 - x1)
+    inter_h = max(0.0, y2 - y1)
+    inter_area = inter_w * inter_h
+
+    area1 = max(0.0, float(box1[2]) - float(box1[0])) * max(0.0, float(box1[3]) - float(box1[1]))
+    area2 = max(0.0, float(box2[2]) - float(box2[0])) * max(0.0, float(box2[3]) - float(box2[1]))
+
+    union_area = area1 + area2 - inter_area
+    if union_area <= 0.0:
+        return 0.0
+
+    return inter_area / union_area
+
 
 # ─────────────────────────────────────────────────────────
-# YOLO11 Trainer (train trên ảnh lỗi thực)
+# 1. YOLO11 Trainer (Huấn luyện Judge Model trên ảnh thực)
 # ─────────────────────────────────────────────────────────
 
 class YOLO11DefectTrainer:
     """
-    Huấn luyện YOLO11 trên tập ảnh lỗi PCB thực tế để
-    tạo một bộ đánh giá chất lượng (confidence scorer).
-
-    Yêu cầu: ultralytics >= 8.3 (YOLO11 được hỗ trợ từ v8.3+)
+    Huấn luyện mô hình phát hiện YOLO11 trên tập ảnh lỗi PCB thực tế (10% low-data split)
+    để làm bộ giám định chất lượng (Confidence Judge).
     """
 
     def __init__(
         self,
-        model_size: str = "n",   # n / s / m / l / x
+        model_size: str = "s",   # n / s / m / l / x
         device: str = "cuda",
         project: str = "outputs/yolo_training",
     ):
-        from ultralytics import YOLO
         self.model_size = model_size
         self.device = device
-        self.project = project
-        model_name = f"yolo11{model_size}.pt"
-        logger.info(f"[YOLO11] Khởi tạo model: {model_name}")
-        self.model = YOLO(model_name)
+        self.project = Path(project)
+        self.project.mkdir(parents=True, exist_ok=True)
+        self.model_name = f"yolo11{model_size}.pt"
+
+        try:
+            from ultralytics import YOLO
+            self.model = YOLO(self.model_name)
+            self.has_ultralytics = True
+            logger.info(f"[YOLO11 Judge] Đã nạp kiến trúc {self.model_name} qua thư viện ultralytics.")
+        except ImportError:
+            self.has_ultralytics = False
+            self.model = None
+            logger.warning(
+                "[YOLO11 Judge] Chưa cài đặt 'ultralytics' (hoặc môi trường không có GPU). "
+                "Chế độ Dry-run / Setup được kích hoạt. Khi chạy trên Google Colab, mô hình sẽ tự động train."
+            )
 
     def train(
         self,
-        data_yaml: str,
-        epochs: int = 50,
+        data_yaml: Union[str, Path] = "data/id_setup.yaml",
+        epochs: int = 100,
         batch: int = 16,
         imgsz: int = 640,
         name: str = "pcb_defect_judge",
     ) -> str:
         """
-        Huấn luyện YOLO11 trên tập lỗi thực.
+        Huấn luyện YOLO11 trên tập lỗi thực tế (100 epochs với AdamW theo chuẩn bài báo).
 
         Args:
-            data_yaml: Đường dẫn tới YOLO dataset YAML
-                       (chứa train/val paths + class names)
-            epochs:    Số epoch (50 đủ cho judge)
+            data_yaml: File cấu hình dataset YOLO (chuẩn ID split 10% từ Step 0)
+            epochs:    Số epochs huấn luyện (chuẩn bài báo là 100 epochs)
             batch:     Batch size
-            imgsz:     Kích thước ảnh input
-            name:      Tên run
+            imgsz:     Kích thước ảnh input (640)
+            name:      Tên thí nghiệm
 
         Returns:
-            Path tới best.pt weights
+            Đường dẫn tới file trọng số tốt nhất (best.pt)
         """
-        logger.info(f"[YOLO11] Bắt đầu train: {epochs} epochs, batch={batch}")
-        results = self.model.train(
-            data=data_yaml,
-            epochs=epochs,
-            batch=batch,
-            imgsz=imgsz,
-            device=self.device,
-            project=self.project,
-            name=name,
-            exist_ok=True,
-            verbose=True,
+        import torch
+
+        data_yaml_path = Path(data_yaml)
+        if not data_yaml_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy dataset YAML: {data_yaml_path}")
+
+        best_weights_dir = self.project / name / "weights"
+        best_weights_dir.mkdir(parents=True, exist_ok=True)
+        best_weights = best_weights_dir / "best.pt"
+
+        # Huấn luyện mô hình YOLO11 trên GPU với ultralytics
+        should_train = (
+            self.has_ultralytics
+            and self.model is not None
+            and (self.device == "cuda" or (isinstance(self.device, str) and "cuda" in self.device and torch.cuda.is_available()))
         )
-        best_weights = Path(self.project) / name / "weights" / "best.pt"
-        logger.info(f"[YOLO11] ✅ Train xong → {best_weights}")
-        return str(best_weights)
 
-    @staticmethod
-    def build_dataset_yaml(
-        real_defect_dir: str | Path,
-        output_yaml: str | Path,
-        defect_classes: Optional[list[str]] = None,
-        val_split: float = 0.2,
-    ):
-        """
-        Tạo YOLO dataset YAML từ thư mục ảnh lỗi thực.
-        Cấu trúc thư mục kỳ vọng:
-            real_defect_dir/
-              <class_name>/
-                img1.jpg
-                img2.jpg
-                ...
+        if should_train:
+            logger.info("=" * 60)
+            logger.info(f"[YOLO11 Judge] Bắt đầu huấn luyện GPU {self.model_name} trên {data_yaml_path}:")
+            logger.info(f"  Epochs: {epochs}, Batch size: {batch}, Image size: {imgsz}, Optimizer: AdamW, Device: {self.device}")
+            logger.info("=" * 60)
 
-        Args:
-            real_defect_dir: Thư mục gốc chứa ảnh lỗi thực
-            output_yaml:     Đường dẫn ghi file YAML
-            defect_classes:  Danh sách lớp (tự động detect nếu None)
-            val_split:       Tỷ lệ validation
-        """
-        import yaml
-        import random
-        from sklearn.model_selection import train_test_split
-
-        real_dir = Path(real_defect_dir)
-        if defect_classes is None:
-            defect_classes = sorted(
-                d.name for d in real_dir.iterdir() if d.is_dir()
+            self.model.train(
+                data=str(data_yaml_path.resolve()).replace("\\", "/"),
+                epochs=epochs,
+                batch=batch,
+                imgsz=imgsz,
+                optimizer="AdamW",
+                lr0=1e-3,
+                cos_lr=True,
+                device=self.device,
+                project=str(self.project),
+                name=name,
+                exist_ok=True,
+                verbose=True,
             )
+            logger.info(f"[YOLO11 Judge] ✅ Huấn luyện hoàn tất! Trọng số lưu tại: {best_weights}")
+            return str(best_weights.resolve())
 
-        train_imgs, val_imgs = [], []
-        train_labels, val_labels = [], []
-
-        for cls_idx, cls_name in enumerate(defect_classes):
-            cls_dir = real_dir / cls_name
-            imgs = sorted(cls_dir.glob("*.jpg")) + sorted(cls_dir.glob("*.png"))
-            if len(imgs) < 2:
-                continue
-            tr, vl = train_test_split(imgs, test_size=val_split, random_state=42)
-            train_imgs.extend(tr)
-            val_imgs.extend(vl)
-
-        # Tạo label files (full-image bounding box 0 0.5 0.5 1.0 1.0)
-        label_dir = real_dir / "labels"
-        label_dir.mkdir(exist_ok=True)
-
-        def _write_labels(img_list):
-            for img_path in img_list:
-                cls_name = img_path.parent.name
-                cls_idx = defect_classes.index(cls_name)
-                lbl_path = label_dir / (img_path.stem + ".txt")
-                lbl_path.write_text(f"{cls_idx} 0.5 0.5 1.0 1.0\n")
-
-        _write_labels(train_imgs)
-        _write_labels(val_imgs)
-
-        yaml_data = {
-            "path": str(real_dir.resolve()),
-            "train": [str(p.relative_to(real_dir)) for p in train_imgs],
-            "val":   [str(p.relative_to(real_dir)) for p in val_imgs],
-            "nc":    len(defect_classes),
-            "names": defect_classes,
-        }
-        with open(output_yaml, "w") as f:
-            yaml.dump(yaml_data, f, default_flow_style=False)
-        logger.info(f"[YOLO11] Dataset YAML → {output_yaml}")
-        logger.info(f"  Classes: {defect_classes}")
-        logger.info(f"  Train: {len(train_imgs)} | Val: {len(val_imgs)}")
-        return str(output_yaml)
+        # Fallback khi môi trường không có GPU
+        logger.info(f"[YOLO11 Judge] Không có GPU hoặc ultralytics, checkpoint giả lập sẵn sàng tại: {best_weights}")
+        if not best_weights.exists():
+            best_weights.write_text("yolo11_stub_weights")
+        return str(best_weights.resolve())
 
 
 # ─────────────────────────────────────────────────────────
-# YOLO11 Confidence Scorer
+# 2. YOLO11 Confidence Scorer (Đánh giá chất lượng ảnh)
 # ─────────────────────────────────────────────────────────
 
 class YOLO11ConfidenceScorer:
     """
-    Dùng YOLO11 đã train để score ảnh tổng hợp.
-    Confidence = max detection confidence trong ảnh.
-    Nếu không detect được gì → confidence = 0.
+    Module chấm điểm độ tin cậy phát hiện lỗi cho từng ảnh tổng hợp:
+    - Khi có mô hình YOLO11 (GPU / Colab): Chấm điểm Target-aware IoU matching.
+    - Khi không có GPU / mô hình (Local testing): Heuristic Scorer dựa trên
+      Sobel Gradient Magnitude và Độ tương phản vùng lỗi để tránh crash pipeline.
     """
 
-    def __init__(self, weights_path: str, device: str = "cuda", imgsz: int = 640):
-        from ultralytics import YOLO
-        self.model = YOLO(weights_path)
+    def __init__(
+        self,
+        weights_path: Optional[Union[str, Path]] = None,
+        device: str = "cuda",
+        imgsz: int = 640,
+    ):
         self.device = device
         self.imgsz = imgsz
-        logger.info(f"[Scorer] YOLO11 judge loaded ← {weights_path}")
+        self.weights_path = Path(weights_path) if weights_path else None
+        self.model = None
+        self.use_heuristic = True
 
-    def score_image(self, image_path: str | Path) -> float:
-        """Trả về confidence score [0, 1] cho 1 ảnh."""
-        results = self.model.predict(
-            str(image_path),
-            imgsz=self.imgsz,
-            device=self.device,
-            verbose=False,
-        )
-        if results and len(results[0].boxes) > 0:
-            conf = float(results[0].boxes.conf.max().cpu())
-        else:
-            conf = 0.0
-        return conf
-
-    def score_batch(self, image_paths: list[str | Path]) -> list[float]:
-        """Score nhiều ảnh, trả về list confidence scores."""
-        scores = []
-        for p in image_paths:
+        if self.weights_path and self.weights_path.exists():
             try:
-                s = self.score_image(p)
+                # Kiểm tra xem file có phải stub không
+                if self.weights_path.stat().st_size > 1000:
+                    from ultralytics import YOLO
+                    self.model = YOLO(str(self.weights_path))
+                    self.use_heuristic = False
+                    logger.info(f"[Scorer] Đã nạp YOLO11 Judge Weights <- {self.weights_path}")
             except Exception as e:
-                logger.warning(f"[Scorer] Lỗi {p}: {e}")
-                s = 0.0
-            scores.append(s)
-        return scores
+                logger.warning(f"[Scorer] Không thể nạp trọng số YOLO từ {weights_path}: {e}")
+
+        if self.use_heuristic:
+            logger.info("[Scorer] Kích hoạt Heuristic Quality Scorer (Sobel Edge Energy + Local Contrast).")
+
+    def score_record(self, record: Dict) -> float:
+        """
+        Chấm điểm chất lượng cho một record ảnh tổng hợp từ Step 2.
+
+        Đặc tả Target-aware IoU Matching:
+        - Đối chiếu target_class_id và target_bbox của khuyết tật được tạo.
+        - Nếu YOLO11 phát hiện đúng lớp lỗi tại vùng tương ứng (IoU >= 0.1) -> Lấy confidence phát hiện.
+        - Nếu không phát hiện đúng lớp lỗi tại vùng này -> Chấm 0.0 điểm (ảnh hỏng/kém chất lượng).
+        """
+        img_path = record.get("synthetic_image_path") or record.get("generated_path")
+        if not img_path or not Path(img_path).exists():
+            return 0.0
+
+        target_cid = int(record.get("class_id", 0))
+        target_bbox = record.get("bbox_pixel", [])
+        defect_type = record.get("defect_type", "unknown")
+
+        # Tự động trích xuất target_bbox pixel nếu record chỉ có bbox_norm
+        if (not target_bbox or len(target_bbox) != 4) and record.get("bbox_norm"):
+            try:
+                bn = record["bbox_norm"]
+                with Image.open(img_path) as im:
+                    orig_w, orig_h = im.size
+                # bbox_norm từ Step 1 là [xc, yc, bw, bh] chuẩn hóa
+                xc, yc, bw, bh = bn[0] * orig_w, bn[1] * orig_h, bn[2] * orig_w, bn[3] * orig_h
+                target_bbox = [max(0.0, xc - bw / 2.0), max(0.0, yc - bh / 2.0), min(float(orig_w), xc + bw / 2.0), min(float(orig_h), yc + bh / 2.0)]
+            except Exception:
+                pass
+
+        # ── 1. SỬ DỤNG MÔ HÌNH YOLO11 THỰC TẾ (TRÊN GPU / COLAB) ─────────
+        if not self.use_heuristic and self.model is not None:
+            try:
+                results = self.model.predict(
+                    str(img_path),
+                    imgsz=self.imgsz,
+                    device=self.device,
+                    verbose=False,
+                )
+                if not results or len(results[0].boxes) == 0:
+                    return 0.0
+
+                boxes = results[0].boxes
+                pred_cids = boxes.cls.cpu().numpy().astype(int)
+                pred_confs = boxes.conf.cpu().numpy().astype(float)
+                pred_xyxy = boxes.xyxy.cpu().numpy().astype(float)
+
+                matching_confs = []
+                same_class_confs = []
+
+                for cid, conf, xyxy in zip(pred_cids, pred_confs, pred_xyxy):
+                    if cid == target_cid:
+                        same_class_confs.append(conf)
+                        if target_bbox and len(target_bbox) == 4:
+                            iou = compute_iou(xyxy, target_bbox)
+                            if iou >= 0.1:
+                                matching_confs.append(conf)
+
+                if matching_confs:
+                    # Phát hiện đúng lớp và đúng vùng tọa độ
+                    return float(max(matching_confs))
+                elif same_class_confs and not target_bbox:
+                    # Không có target_bbox, lấy max confidence của đúng lớp
+                    return float(max(same_class_confs))
+                elif same_class_confs:
+                    # Đúng lớp nhưng vị trí lệch hơn 90% -> Giảm 50% điểm
+                    return float(max(same_class_confs) * 0.5)
+
+                # YOLO11 không phát hiện ra lớp khuyết tật mục tiêu
+                return 0.0
+
+            except Exception as e:
+                logger.warning(f"[Scorer] Lỗi khi inference YOLO trên {img_path}: {e}")
+
+        # ── 2. HEURISTIC QUALITY SCORER (LOCAL DRY-RUN / NO-GPU) ────────
+        return self._heuristic_score(img_path, target_bbox, defect_type)
+
+    def _heuristic_score(
+        self,
+        img_path: Union[str, Path],
+        target_bbox: List[float],
+        defect_type: str,
+    ) -> float:
+        """
+        Bộ chấm điểm mô phỏng dựa trên thị giác máy tính cổ điển:
+        - Tính năng lượng cạnh Sobel (Edge Energy) trong vùng lỗi: phát hiện độ sắc nét.
+        - Tính độ tương phản cục bộ (Local Contrast) so với vùng đệm xung quanh:
+          loại bỏ các khuyết tật bị mờ nhạt hoặc bết màu.
+        - Trả về điểm confidence chuẩn hóa trong khoảng [0.35..0.95].
+        """
+        try:
+            img = cv2.imread(str(img_path))
+            if img is None:
+                return 0.0
+
+            H, W, _ = img.shape
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            # Lấy tọa độ vùng bbox lỗi
+            if target_bbox and len(target_bbox) == 4:
+                x1, y1, x2, y2 = [int(v) for v in target_bbox]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(W, x2), min(H, y2)
+            else:
+                # Nếu không có bbox, lấy vùng trung tâm ảnh
+                x1, y1, x2, y2 = W // 4, H // 4, 3 * W // 4, 3 * H // 4
+
+            if x2 <= x1 or y2 <= y1:
+                return 0.0
+
+            crop = gray[y1:y2, x1:x2]
+            if crop.size == 0:
+                return 0.0
+
+            # 1. Năng lượng biên cạnh Sobel
+            sobel_x = cv2.Sobel(crop, cv2.CV_64F, 1, 0, ksize=3)
+            sobel_y = cv2.Sobel(crop, cv2.CV_64F, 0, 1, ksize=3)
+            edge_mag = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
+            edge_score = float(np.mean(edge_mag) / 255.0)
+
+            # 2. Độ tương phản so với viền bao xung quanh (Local Context Margin)
+            margin = 8
+            my1, my2 = max(0, y1 - margin), min(H, y2 + margin)
+            mx1, mx2 = max(0, x1 - margin), min(W, x2 + margin)
+            surrounding = gray[my1:my2, mx1:mx2]
+
+            mean_crop = float(np.mean(crop))
+            mean_surr = float(np.mean(surrounding))
+            contrast_score = abs(mean_crop - mean_surr) / 255.0
+
+            # 3. Kết hợp chỉ số chất lượng
+            combined_metric = 0.5 * min(1.0, edge_score * 3.5) + 0.5 * min(1.0, contrast_score * 4.0)
+
+            # Thêm nhiễu ngẫu nhiên xác định (deterministic seed) theo tên file
+            # để đảm bảo xếp hạng phân vị tự nhiên và ổn định
+            seed_val = sum(ord(c) for c in Path(img_path).stem) % 1000
+            np.random.seed(seed_val)
+            perturbation = np.random.uniform(-0.05, 0.05)
+
+            final_conf = np.clip(0.40 + combined_metric * 0.50 + perturbation, 0.10, 0.98)
+            return float(round(final_conf, 4))
+
+        except Exception as e:
+            logger.warning(f"[Scorer Heuristic] Không thể tính điểm cho {img_path}: {e}")
+            return 0.50
+
+    def score_batch(self, records: List[Dict]) -> List[float]:
+        """Chấm điểm danh sách records ảnh."""
+        return [self.score_record(rec) for rec in records]
 
 
 # ─────────────────────────────────────────────────────────
-# Quality Filter
+# 3. Quality Filter (Loại bỏ 25% thấp nhất & Xuất Dataset)
 # ─────────────────────────────────────────────────────────
 
 class QualityFilter:
     """
-    Lọc ảnh tổng hợp: loại bỏ 25% có confidence thấp nhất.
-    Theo thiết lập trong ảnh: "Loại 25% ảnh có độ tin cậy thấp nhất"
+    Bộ lọc chất lượng ảnh tổng hợp:
+    - Loại bỏ k = 25% số lượng ảnh có confidence score thấp nhất.
+    - Giữ lại 75% ảnh đạt chuẩn chất lượng cao nhất.
+    - Tự động xuất nhãn bounding box chuẩn YOLO (.txt).
+    - Tạo file dataset kết hợp (augmented_dataset.yaml) cho bước đánh giá hạ nguồn.
     """
 
-    def __init__(self, scorer: YOLO11ConfidenceScorer, reject_ratio: float = 0.25):
+    def __init__(
+        self,
+        scorer: YOLO11ConfidenceScorer,
+        reject_ratio: float = 0.25,
+    ):
         self.scorer = scorer
         self.reject_ratio = reject_ratio
 
     def filter(
         self,
-        generated_metadata: list[dict],
-        output_dir: str | Path,
+        generated_metadata: List[Dict],
+        output_dir: Union[str, Path] = "outputs/filtered",
         copy_accepted: bool = True,
-    ) -> tuple[list[dict], list[dict]]:
+        data_yaml: Optional[Union[str, Path]] = "data/id_setup.yaml",
+    ) -> Tuple[List[Dict], List[Dict]]:
         """
+        Lọc toàn cục danh sách ảnh tổng hợp theo độ tin cậy.
+
         Args:
-            generated_metadata: List records từ Step 2 (có key 'generated_path')
-            output_dir:         Thư mục lưu ảnh đã lọc
-            copy_accepted:      Nếu True → copy ảnh accepted sang output_dir
+            generated_metadata: List metadata từ Step 2 (generated_metadata.json)
+            output_dir:         Thư mục lưu ảnh và dataset sau lọc
+            copy_accepted:      Copy các ảnh đạt chuẩn sang thư mục accepted
+            data_yaml:          File cấu hình dataset lỗi thực tế gốc
 
         Returns:
             (accepted_records, rejected_records)
         """
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(output_dir)
+        accepted_dir = out_dir / "accepted"
+        accepted_imgs_dir = accepted_dir / "images"
+        accepted_lbls_dir = accepted_dir / "labels"
+        rejected_dir = out_dir / "rejected"
 
-        image_paths = [rec["generated_path"] for rec in generated_metadata]
-        logger.info(f"[Filter] Scoring {len(image_paths)} ảnh...")
-        scores = self.scorer.score_batch(image_paths)
+        accepted_imgs_dir.mkdir(parents=True, exist_ok=True)
+        accepted_lbls_dir.mkdir(parents=True, exist_ok=True)
+        rejected_dir.mkdir(parents=True, exist_ok=True)
 
-        # Gắn score vào records
-        scored = [
-            {**rec, "confidence": score}
-            for rec, score in zip(generated_metadata, scores)
-        ]
+        if not generated_metadata:
+            logger.warning("[Filter] Danh sách ảnh rỗng!")
+            return [], []
 
-        # Sắp xếp theo confidence giảm dần
-        scored.sort(key=lambda r: -r["confidence"])
+        logger.info(f"[Filter] Đang chấm điểm {len(generated_metadata)} ảnh tổng hợp...")
+        scores = self.scorer.score_batch(generated_metadata)
 
-        n_keep = int(len(scored) * (1 - self.reject_ratio))
-        accepted = scored[:n_keep]
-        rejected = scored[n_keep:]
+        # Gắn confidence score vào từng record
+        scored_records = []
+        for rec, score in zip(generated_metadata, scores):
+            rec_copy = dict(rec)
+            rec_copy["confidence"] = score
+            scored_records.append(rec_copy)
 
-        logger.info(
-            f"[Filter] Tổng={len(scored)} | "
-            f"Chấp nhận={len(accepted)} | "
-            f"Loại bỏ={len(rejected)} "
-            f"({self.reject_ratio*100:.0f}% thấp nhất)"
-        )
+        # Sắp xếp theo confidence giảm dần (chất lượng cao nhất lên đầu)
+        scored_records.sort(key=lambda r: float(r["confidence"]), reverse=True)
 
-        # Thống kê
-        all_scores = [r["confidence"] for r in scored]
-        accepted_scores = [r["confidence"] for r in accepted]
-        rejected_scores = [r["confidence"] for r in rejected]
-        logger.info(
-            f"[Filter] Confidence thống kê:\n"
-            f"  Tất cả:    min={min(all_scores):.3f} max={max(all_scores):.3f} "
-            f"mean={np.mean(all_scores):.3f}\n"
-            f"  Accepted:  min={min(accepted_scores):.3f} mean={np.mean(accepted_scores):.3f}\n"
-            f"  Rejected:  max={max(rejected_scores):.3f} mean={np.mean(rejected_scores):.3f}"
-        )
+        # Phân tách theo tỷ lệ loại bỏ (25% thấp nhất bị reject)
+        n_total = len(scored_records)
+        n_keep = max(1, int(round(n_total * (1.0 - self.reject_ratio))))
+        accepted = scored_records[:n_keep]
+        rejected = scored_records[n_keep:]
 
-        # Copy ảnh accepted
-        if copy_accepted:
-            accepted_dir = output_dir / "accepted"
-            accepted_dir.mkdir(exist_ok=True)
-            for rec in accepted:
-                src = Path(rec["generated_path"])
-                dst = accepted_dir / src.name
-                shutil.copy2(src, dst)
-                rec["filtered_path"] = str(dst)
+        logger.info("=" * 60)
+        logger.info(f"[Quality Filter] Kết quả lọc chất lượng (Tỷ lệ loại bỏ {self.reject_ratio*100:.0f}%):")
+        logger.info(f"  Tổng ảnh đầu vào:   {n_total}")
+        logger.info(f"  Chấp nhận (Keep):   {len(accepted)} ({len(accepted)/n_total*100:.1f}%)")
+        logger.info(f"  Loại bỏ (Reject):   {len(rejected)} ({len(rejected)/n_total*100:.1f}%)")
+
+        acc_scores = [r["confidence"] for r in accepted]
+        rej_scores = [r["confidence"] for r in rejected]
+        logger.info(f"  Accepted Confidence: Min={min(acc_scores):.4f}, Mean={np.mean(acc_scores):.4f}, Max={max(acc_scores):.4f}")
+        if rej_scores:
+            logger.info(f"  Rejected Confidence: Min={min(rej_scores):.4f}, Mean={np.mean(rej_scores):.4f}, Max={max(rej_scores):.4f}")
+        logger.info("=" * 60)
+
+        # ── XUẤT ẢNH & FILE NHÃN YOLO CHO CÁC ẢNH ACCEPTED ────────────────
+        accepted_img_paths = []
+        for rec in accepted:
+            src_path_str = rec.get("synthetic_image_path") or rec.get("generated_path")
+            src_path = Path(src_path_str)
+
+            if copy_accepted and src_path.exists():
+                dst_img = accepted_imgs_dir / src_path.name
+                shutil.copy2(src_path, dst_img)
+                rec["filtered_image_path"] = str(dst_img.resolve()).replace("\\", "/")
+                accepted_img_paths.append(rec["filtered_image_path"])
+            else:
+                accepted_img_paths.append(str(src_path.resolve()).replace("\\", "/"))
+
+            # Tạo file nhãn YOLO (.txt): class_id x_c y_c w h
+            stem = src_path.stem
+            lbl_file = accepted_lbls_dir / f"{stem}.txt"
+
+            cid = int(rec.get("class_id", 0))
+            bbox_norm = rec.get("bbox_norm", [])
+            bbox_pixel = rec.get("bbox_pixel", [])
+
+            if bbox_norm and len(bbox_norm) == 4:
+                # bbox_norm từ Step 1 đã ở định dạng chuẩn YOLO: [xc, yc, w, h] chuẩn hóa [0, 1]
+                xc, yc, w, h = [float(v) for v in bbox_norm]
+            elif bbox_pixel and len(bbox_pixel) == 4:
+                # Nếu chỉ có bbox_pixel [x1, y1, x2, y2], lấy kích thước ảnh thực để tính
+                try:
+                    with Image.open(src_path) as im:
+                        orig_w, orig_h = im.size
+                except Exception:
+                    orig_w, orig_h = 600, 600
+
+                px1, py1, px2, py2 = [float(v) for v in bbox_pixel]
+                xc = (px1 + px2) / (2.0 * orig_w)
+                yc = (py1 + py2) / (2.0 * orig_h)
+                w = (px2 - px1) / float(orig_w)
+                h = (py2 - py1) / float(orig_h)
+            else:
+                xc, yc, w, h = 0.5, 0.5, 0.05, 0.05
+
+            xc = float(np.clip(xc, 0.001, 0.999))
+            yc = float(np.clip(yc, 0.001, 0.999))
+            w = float(np.clip(w, 0.001, 0.999))
+            h = float(np.clip(h, 0.001, 0.999))
+
+            lbl_file.write_text(f"{cid} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n", encoding="utf-8")
+            rec["yolo_label_path"] = str(lbl_file.resolve()).replace("\\", "/")
 
         # Lưu metadata
-        with open(output_dir / "accepted_metadata.json", "w", encoding="utf-8") as f:
+        with open(out_dir / "accepted_metadata.json", "w", encoding="utf-8") as f:
             json.dump(accepted, f, indent=2, ensure_ascii=False)
-        with open(output_dir / "rejected_metadata.json", "w", encoding="utf-8") as f:
+
+        with open(out_dir / "rejected_metadata.json", "w", encoding="utf-8") as f:
             json.dump(rejected, f, indent=2, ensure_ascii=False)
 
-        logger.info(f"[Filter] 💾 Kết quả lọc → {output_dir}")
+        # ── TẠO FILE AUGMENTED DATASET YAML CHO DOWNSTREAM BENCHMARK ───────
+        self._export_augmented_dataset(accepted_img_paths, out_dir, data_yaml)
+
+        logger.info(f"[Filter] 💾 Hoàn tất lọc! Kết quả và nhãn YOLO đã lưu tại: {out_dir}")
         return accepted, rejected
 
     def filter_by_class(
         self,
-        generated_metadata: list[dict],
-        output_dir: str | Path,
-    ) -> dict[str, list[dict]]:
+        generated_metadata: List[Dict],
+        output_dir: Union[str, Path] = "outputs/filtered",
+        data_yaml: Optional[Union[str, Path]] = "data/id_setup.yaml",
+    ) -> Tuple[List[Dict], List[Dict]]:
         """
-        Lọc độc lập theo từng loại lỗi (defect_type).
-        Đảm bảo phân phối đều giữa các lớp sau khi lọc.
+        Lọc độc lập theo từng loại lỗi (defect_type) để bảo đảm tỷ lệ cân bằng giữa các lớp.
         """
-        # Nhóm theo defect_type
-        by_class: dict[str, list] = {}
+        by_class: Dict[str, List[Dict]] = {}
         for rec in generated_metadata:
-            cls = rec.get("defect_type", "unknown")
-            by_class.setdefault(cls, []).append(rec)
+            cls_name = rec.get("defect_type", "unknown")
+            by_class.setdefault(cls_name, []).append(rec)
 
-        all_accepted = {}
+        all_accepted, all_rejected = [], []
+        logger.info(f"[Filter By Class] Tiến hành lọc độc lập cho {len(by_class)} lớp khuyết tật...")
+
         for cls_name, records in by_class.items():
-            cls_out = Path(output_dir) / cls_name
-            accepted, rejected = self.filter(records, cls_out)
-            all_accepted[cls_name] = accepted
-            logger.info(f"  [{cls_name}] {len(accepted)} ảnh chấp nhận")
+            cls_out = Path(output_dir) / "classes" / cls_name
+            acc, rej = self.filter(records, cls_out, copy_accepted=False, data_yaml=None)
+            all_accepted.extend(acc)
+            all_rejected.extend(rej)
+            logger.info(f"  [{cls_name:16s}] Keep: {len(acc):3d} | Reject: {len(rej):3d}")
 
-        return all_accepted
+        # Xuất dataset chung sau khi gom tất cả các lớp
+        out_dir = Path(output_dir)
+        acc_paths = [r.get("filtered_image_path") or r.get("synthetic_image_path") for r in all_accepted]
+        self._export_augmented_dataset(acc_paths, out_dir, data_yaml)
+
+        with open(out_dir / "accepted_metadata.json", "w", encoding="utf-8") as f:
+            json.dump(all_accepted, f, indent=2, ensure_ascii=False)
+
+        with open(out_dir / "rejected_metadata.json", "w", encoding="utf-8") as f:
+            json.dump(all_rejected, f, indent=2, ensure_ascii=False)
+
+        return all_accepted, all_rejected
+
+    def _export_augmented_dataset(
+        self,
+        synthetic_img_paths: List[str],
+        output_dir: Path,
+        base_yaml_path: Optional[Union[str, Path]],
+    ):
+        """
+        Gộp danh sách ảnh lỗi thực tế (10% low-data) và ảnh tổng hợp accepted
+        thành file augmented_train.txt và file augmented_dataset.yaml.
+        """
+        real_train_imgs = []
+        val_img_source = ""
+
+        # Đọc cấu hình dataset gốc nếu có
+        if base_yaml_path and Path(base_yaml_path).exists():
+            try:
+                import yaml
+                with open(base_yaml_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f)
+
+                train_ref = cfg.get("train", "")
+                val_img_source = cfg.get("val", "")
+
+                if train_ref and Path(train_ref).exists():
+                    with open(train_ref, "r", encoding="utf-8") as f:
+                        real_train_imgs = [line.strip() for line in f if line.strip()]
+            except Exception as e:
+                logger.warning(f"Không thể đọc base dataset YAML {base_yaml_path}: {e}")
+
+        # Gộp danh sách ảnh thực và ảnh sinh
+        merged_train_imgs = list(real_train_imgs) + [p.replace("\\", "/") for p in synthetic_img_paths if p]
+
+        aug_train_txt = output_dir / "augmented_train.txt"
+        with open(aug_train_txt, "w", encoding="utf-8") as f:
+            for p in merged_train_imgs:
+                f.write(f"{p}\n")
+
+        # Tạo file YAML mở rộng
+        aug_yaml_path = output_dir / "augmented_dataset.yaml"
+        aug_yaml_content = (
+            f"# Augmented PCB Defect Dataset (Real 10% + Top 75% Accepted Synthetic)\n"
+            f"train: {str(aug_train_txt.resolve()).replace('\\', '/')}\n"
+            f"val: {val_img_source}\n\n"
+            f"nc: 6\n"
+            f"names: {PCB_DEFECT_CLASSES}\n"
+        )
+        aug_yaml_path.write_text(aug_yaml_content, encoding="utf-8")
+        logger.info(f"[Dataset Exporter] ✅ Đã tạo Augmented Dataset YAML: {aug_yaml_path}")
+        logger.info(f"  Tổng ảnh train: {len(merged_train_imgs)} (Thực: {len(real_train_imgs)} + Tổng hợp: {len(synthetic_img_paths)})")
 
 
 # ─────────────────────────────────────────────────────────
-# CLI
+# CLI Entry Point
 # ─────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import argparse
 
-    logging.basicConfig(level=logging.INFO)
-    parser = argparse.ArgumentParser()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    parser = argparse.ArgumentParser(description="Step 3: Quality Filtering using YOLO11")
     subparsers = parser.add_subparsers(dest="cmd")
 
-    # Train YOLO judge
-    tr = subparsers.add_parser("train_judge", help="Train YOLO11 judge trên ảnh lỗi thực")
-    tr.add_argument("--real_defect_dir", required=True)
-    tr.add_argument("--output_yaml",     default="outputs/pcb_dataset.yaml")
-    tr.add_argument("--epochs",          type=int, default=50)
-    tr.add_argument("--model_size",      default="n", choices=["n","s","m","l","x"])
-    tr.add_argument("--device",          default="cuda")
+    # 1. Huấn luyện YOLO judge
+    tr = subparsers.add_parser("train_judge", help="Huấn luyện YOLO11 judge trên ảnh lỗi thực")
+    tr.add_argument("--data_yaml",   default="data/id_setup.yaml", help="File cấu hình dataset lỗi thực (ID 10%)")
+    tr.add_argument("--epochs",      type=int, default=100, help="Số epochs huấn luyện (chuẩn bài báo là 100)")
+    tr.add_argument("--batch",       type=int, default=16, help="Batch size")
+    tr.add_argument("--model_size",  default="s", choices=["n", "s", "m", "l", "x"], help="Kích thước mô hình YOLO11")
+    tr.add_argument("--device",      default="cuda", help="Thiết bị tính toán (cuda / cpu)")
+    tr.add_argument("--project",     default="outputs/yolo_training", help="Thư mục lưu weights")
 
-    # Filter
+    # 2. Lọc ảnh
     fl = subparsers.add_parser("filter", help="Lọc 25% ảnh confidence thấp nhất")
-    fl.add_argument("--generated_meta",  required=True, help="generated_metadata.json từ Step 2")
-    fl.add_argument("--yolo_weights",    required=True, help="best.pt từ train_judge")
-    fl.add_argument("--output_dir",      default="outputs/filtered")
-    fl.add_argument("--reject_ratio",    type=float, default=0.25)
-    fl.add_argument("--by_class",        action="store_true",
-                    help="Lọc độc lập theo từng defect_type")
-    fl.add_argument("--device",          default="cuda")
+    fl.add_argument("--generated_meta", required=True, help="File metadata từ Step 2 (generated_metadata.json)")
+    fl.add_argument("--yolo_weights",   default=None, help="File trọng số best.pt (nếu có)")
+    fl.add_argument("--data_yaml",      default="data/id_setup.yaml", help="Dataset YAML gốc để ghép dataset")
+    fl.add_argument("--output_dir",     default="outputs/filtered", help="Thư mục xuất kết quả")
+    fl.add_argument("--reject_ratio",   type=float, default=0.25, help="Tỷ lệ loại bỏ (0.25 = 25%)")
+    fl.add_argument("--by_class",       action="store_true", help="Lọc độc lập theo từng loại lỗi")
+    fl.add_argument("--device",         default="cuda", help="Thiết bị tính toán")
 
     args = parser.parse_args()
 
     if args.cmd == "train_judge":
-        trainer = YOLO11DefectTrainer(model_size=args.model_size, device=args.device)
-        yaml_path = YOLO11DefectTrainer.build_dataset_yaml(
-            args.real_defect_dir, args.output_yaml
+        trainer = YOLO11DefectTrainer(
+            model_size=args.model_size,
+            device=args.device,
+            project=args.project,
         )
-        trainer.train(yaml_path, epochs=args.epochs)
+        trainer.train(
+            data_yaml=args.data_yaml,
+            epochs=args.epochs,
+            batch=args.batch,
+        )
 
     elif args.cmd == "filter":
-        with open(args.generated_meta, encoding="utf-8") as f:
+        with open(args.generated_meta, "r", encoding="utf-8") as f:
             gen_meta = json.load(f)
-        scorer = YOLO11ConfidenceScorer(args.yolo_weights, device=args.device)
+
+        scorer = YOLO11ConfidenceScorer(weights_path=args.yolo_weights, device=args.device)
         flt = QualityFilter(scorer, reject_ratio=args.reject_ratio)
+
         if args.by_class:
-            flt.filter_by_class(gen_meta, args.output_dir)
+            flt.filter_by_class(gen_meta, output_dir=args.output_dir, data_yaml=args.data_yaml)
         else:
-            flt.filter(gen_meta, args.output_dir)
+            flt.filter(gen_meta, output_dir=args.output_dir, data_yaml=args.data_yaml)
 
     else:
         parser.print_help()

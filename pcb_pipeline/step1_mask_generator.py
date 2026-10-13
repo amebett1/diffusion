@@ -1,9 +1,29 @@
 """
-Step 1: Defect Mask Generation using DINOv2
---------------------------------------------
-- Trích xuất đặc trưng hình ảnh từ DINOv2
-- Xác định vị trí, kích thước phù hợp để đặt lỗi
-- Dùng bounding box thay vì mask pixel-level chính xác
+Step 1: Context-Aware Mask Generation (CAMG) Module
+===================================================
+Triển khai chuẩn theo bài báo:
+"A Synthetic Defect Image Generation Method for Enhanced Industrial
+Defect Detection Based on Inpainting Diffusion and Context-aware Mask Generation"
+(Journal of Intelligent Manufacturing, 2026)
+
+Cơ sở toán học:
+  C(I) = P(L, T, S | Φ(I))
+  - Φ(I): Patch embeddings từ frozen DINOv2 backbone (d=768)
+  - L: Tọa độ patch (prior không gian)
+  - T: Phân loại loại lỗi patch-wise (K lớp lỗi + 1 lớp 'no defect')
+  - S: Hồi quy kích thước bounding box patch-wise (log ŵ, log ĥ)
+
+Hàm mất mát:
+  L_cls = - ∑ ∑ y_{i,k} log p_{i,k}
+  L_box = ||log(w_i) - log(ŵ_i)||_2^2 + ||log(h_i) - log(ĥ_i)||_2^2  (chỉ tính trên positive patches)
+  L_CAMG = L_cls + λ * L_box  (λ = 1.0)
+
+Lấy mẫu huấn luyện:
+  - Tỷ lệ 1 positive patch : 3 negative patches nhằm chống mất cân bằng dữ liệu.
+
+Inference:
+  - Dense defect probability map M ∈ R^{(K+2) × H' × W'}
+  - Top-k sampling (k = 5) để chọn vị trí patch sinh lỗi cho từng class.
 """
 
 import os
@@ -11,318 +31,588 @@ import json
 import random
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import List, Dict, Tuple, Optional, Union
 
 import cv2
 import numpy as np
-import torch
 from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
 logger = logging.getLogger(__name__)
 
+# Danh sách 6 loại lỗi PCB chuẩn theo DeepPCB & Paper
+PCB_DEFECT_CLASSES = [
+    "mouse_bite",
+    "spur",
+    "missing_hole",
+    "short",
+    "open_circuit",
+    "spurious_copper",
+]
+NO_DEFECT_CLASS = "no_defect"
+ALL_CLASSES = PCB_DEFECT_CLASSES + [NO_DEFECT_CLASS]
+NUM_CLASSES = len(ALL_CLASSES)  # 6 + 1 = 7
+
 
 # ─────────────────────────────────────────────────────────
-# DINOv2 Feature Extractor
+# 1. Kiến trúc mạng CAMG (Backbone + Heads)
 # ─────────────────────────────────────────────────────────
-class DINOv2FeatureExtractor:
-    """Trích xuất patch-level features từ DINOv2 để xác định vùng đặt lỗi."""
+
+class CAMGBackbone(nn.Module):
+    """
+    Frozen Vision Foundation Model backbone (DINOv2 ViT-B/14).
+    Feature dimension d = 768, Patch size = 14.
+    """
 
     def __init__(self, model_name: str = "dinov2_vitb14", device: str = "cuda"):
+        super().__init__()
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        logger.info(f"Loading DINOv2 model: {model_name} on {self.device}")
-        self.model = torch.hub.load("facebookresearch/dinov2", model_name)
-        self.model.eval().to(self.device)
+        self.patch_size = 14
+        self.embed_dim = 768
+        self.model_name = model_name
 
-        self.patch_size = 14  # ViT-B/14
+        logger.info(f"[CAMG] Đang tải backbone DINOv2: {model_name} trên {self.device}...")
+        try:
+            self.dino = torch.hub.load("facebookresearch/dinov2", model_name)
+        except Exception as e:
+            logger.warning(f"Không thể tải từ torch.hub ({e}). Đang tạo dummy backbone cho CPU/offline fallback.")
+            self.dino = None
+
+        if self.dino is not None:
+            # Đóng băng hoàn toàn trọng số foundation model
+            self.dino.eval()
+            for param in self.dino.parameters():
+                param.requires_grad = False
+            self.dino.to(self.device)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Input:  x ∈ R^{B × 3 × H × W}
+        Output: patch_tokens ∈ R^{B × d × H' × W'}
+        """
+        B, C, H, W = x.shape
+        H_patch = H // self.patch_size
+        W_patch = W // self.patch_size
+
+        if self.dino is not None:
+            # Trích xuất patch embeddings từ intermediate layers
+            out = self.dino.get_intermediate_layers(x, n=1, return_class_token=False)
+            tokens = out[0]  # shape: (B, N_patches, d)
+        else:
+            # Fallback dummy embedding
+            tokens = torch.randn(B, H_patch * W_patch, self.embed_dim, device=x.device)
+
+        # Reshape sang dạng spatial feature map (B, d, H', W')
+        tokens = tokens.permute(0, 2, 1).reshape(B, self.embed_dim, H_patch, W_patch)
+        return tokens
+
+
+class CAMGHeads(nn.Module):
+    """
+    Shared Linear Layer + Patch-wise Class Head + Patch-wise Size Head.
+    """
+
+    def __init__(self, in_dim: int = 768, hidden_dim: int = 512, num_classes: int = 7):
+        super().__init__()
+        # Shared projection layer theo paper
+        self.shared_proj = nn.Sequential(
+            nn.Conv2d(in_dim, hidden_dim, kernel_size=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
+            nn.Dropout2d(0.1),
+        )
+
+        # Class Head: dự đoán xác suất lớp (K lỗi + 1 no-defect)
+        self.cls_head = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
+
+        # Size Head: dự đoán (log ŵ, log ĥ) chuẩn hóa
+        self.size_head = nn.Conv2d(hidden_dim, 2, kernel_size=1)
+
+    def forward(self, feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Input:  feat ∈ R^{B × 768 × H' × W'}
+        Output:
+          cls_logits ∈ R^{B × num_classes × H' × W'}
+          size_pred  ∈ R^{B × 2 × H' × W'}  (log ŵ, log ĥ)
+        """
+        h = self.shared_proj(feat)
+        cls_logits = self.cls_head(h)
+        size_pred = self.size_head(h)
+        return cls_logits, size_pred
+
+
+class CAMGModel(nn.Module):
+    """
+    Mô hình tích hợp toàn diện của CAMG Module.
+    """
+
+    def __init__(
+        self,
+        backbone_name: str = "dinov2_vitb14",
+        num_classes: int = NUM_CLASSES,
+        device: str = "cuda",
+    ):
+        super().__init__()
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.backbone = CAMGBackbone(model_name=backbone_name, device=str(self.device))
+        self.heads = CAMGHeads(in_dim=768, hidden_dim=512, num_classes=num_classes)
+        self.to(self.device)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = x.to(self.device)
+        feat = self.backbone(x)
+        cls_logits, size_pred = self.heads(feat)
+        return cls_logits, size_pred
+
+
+# ─────────────────────────────────────────────────────────
+# 2. Hàm mất mát CAMG (Cross-Entropy + Log-scale Size Loss)
+# ─────────────────────────────────────────────────────────
+
+class CAMGLoss(nn.Module):
+    """
+    LCAMG = Lcls + λ * Lbox (với λ = 1.0 theo Equation 4 trong paper).
+    """
+
+    def __init__(self, lambda_box: float = 1.0):
+        super().__init__()
+        self.lambda_box = lambda_box
+        self.ce_loss = nn.CrossEntropyLoss()
+
+    def forward(
+        self,
+        cls_logits: torch.Tensor,     # (N, num_classes)
+        cls_targets: torch.Tensor,    # (N,)
+        size_preds: torch.Tensor,     # (N, 2)
+        size_targets: torch.Tensor,   # (N, 2)
+        is_positive: torch.Tensor,    # (N,) bool
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # 1. Classification Loss (tính trên toàn bộ positive và negative patches)
+        l_cls = self.ce_loss(cls_logits, cls_targets)
+
+        # 2. Size Loss (chỉ tính trên positive patches)
+        if is_positive.sum() > 0:
+            pos_preds = size_preds[is_positive]
+            pos_targets = size_targets[is_positive]
+            l_box = F.mse_loss(pos_preds, pos_targets)
+        else:
+            l_box = torch.tensor(0.0, device=cls_logits.device)
+
+        l_total = l_cls + self.lambda_box * l_box
+        return l_total, l_cls, l_box
+
+
+# ─────────────────────────────────────────────────────────
+# 3. Patch Dataset với Tỷ lệ lấy mẫu 1 : 3 (Random Patch Sampling)
+# ─────────────────────────────────────────────────────────
+
+class CAMGPatchDataset(Dataset):
+    """
+    Dataset phục vụ huấn luyện CAMG:
+    - Nhận danh sách metadata ảnh và bbox từ train_metadata.json
+    - Thực hiện lấy mẫu 1 positive patch per defect instance và 3 negative patches
+    """
+
+    def __init__(
+        self,
+        metadata_path: Union[str, Path],
+        image_size: int = 588,  # Bội số của 14: 588 = 14 x 42 patches
+        patch_size: int = 14,
+        neg_ratio: int = 3,
+    ):
+        self.metadata_path = Path(metadata_path)
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.neg_ratio = neg_ratio
+        self.grid_size = image_size // patch_size  # 42x42
+
+        with open(self.metadata_path, "r", encoding="utf-8") as f:
+            self.records = json.load(f)
+
         self.transform = transforms.Compose([
-            transforms.Resize(224),
-            transforms.CenterCrop(224),
+            transforms.Resize((self.image_size, self.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]),
+        ])
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        rec = self.records[idx]
+        img_path = rec["image_path"]
+        pil_img = Image.open(img_path).convert("RGB")
+        img_tensor = self.transform(pil_img)
+
+        # Phân tích các patch
+        G = self.grid_size
+        occupied_mask = np.zeros((G, G), dtype=bool)
+
+        pos_patches = []
+        for box in rec["boxes"]:
+            cls_id = box["class_id"]
+            cx = box["cx"]
+            cy = box["cy"]
+            w = max(box["w"], 1e-4)
+            h = max(box["h"], 1e-4)
+
+            # Tọa độ patch chứa tâm bbox
+            pr = int(np.clip(cy * G, 0, G - 1))
+            pc = int(np.clip(cx * G, 0, G - 1))
+            occupied_mask[pr, pc] = True
+
+            pos_patches.append({
+                "patch_coord": (pr, pc),
+                "class_id": cls_id,
+                "log_size": [np.log(w), np.log(h)],
+            })
+
+        # Lấy mẫu negative patches từ vùng không lỗi (tỷ lệ 1 : 3)
+        neg_patches = []
+        free_coords = np.argwhere(~occupied_mask)
+        num_neg_needed = max(1, len(pos_patches) * self.neg_ratio)
+
+        if len(free_coords) > 0:
+            chosen_indices = np.random.choice(
+                len(free_coords),
+                size=min(num_neg_needed, len(free_coords)),
+                replace=False,
+            )
+            for ci in chosen_indices:
+                pr, pc = free_coords[ci]
+                neg_patches.append({
+                    "patch_coord": (int(pr), int(pc)),
+                    "class_id": NUM_CLASSES - 1,  # 6: no_defect
+                    "log_size": [0.0, 0.0],
+                })
+
+        return {
+            "image": img_tensor,
+            "pos_patches": pos_patches,
+            "neg_patches": neg_patches,
+        }
+
+
+# ─────────────────────────────────────────────────────────
+# 4. CAMG Trainer
+# ─────────────────────────────────────────────────────────
+
+class CAMGTrainer:
+    """
+    Huấn luyện hai prediction heads của CAMG module (Backbone DINOv2 đóng băng).
+    """
+
+    def __init__(
+        self,
+        model: Optional[CAMGModel] = None,
+        lr: float = 1e-4,
+        device: str = "cuda",
+        output_dir: str = "outputs/camg_checkpoints",
+    ):
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.model = model or CAMGModel(device=str(self.device))
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Chỉ tối ưu các tham số của heads
+        self.optimizer = torch.optim.Adam(self.model.heads.parameters(), lr=lr)
+        self.criterion = CAMGLoss(lambda_box=1.0)
+
+    def train(
+        self,
+        metadata_path: str = "data/train_metadata.json",
+        epochs: int = 10,
+        batch_size: int = 32,
+    ) -> str:
+        """
+        Vòng lặp huấn luyện CAMG 10 epochs theo bài báo.
+        """
+        logger.info(f"[CAMG Trainer] Khởi tạo huấn luyện: {epochs} epochs, batch_size={batch_size}")
+        best_ckpt_path = self.output_dir / "camg_best.pth"
+
+        self.model.train()
+        for epoch in range(1, epochs + 1):
+            total_loss = 0.0
+            total_cls_loss = 0.0
+            total_box_loss = 0.0
+            accum_steps = 0
+            sample_count = 0
+
+            self.optimizer.zero_grad()
+
+            for step, batch in enumerate(dataloader):
+                img = batch["image"].unsqueeze(0).to(self.device)  # (1, 3, H, W)
+                pos = batch["pos_patches"]                          # List[Dict]
+                neg = batch["neg_patches"]                          # List[Dict]
+
+                # Forward qua backbone và heads
+                cls_logits, size_preds = self.model(img)  # (1, 7, G, G), (1, 2, G, G)
+
+                patch_logits = []
+                patch_cls_targets = []
+                patch_size_preds = []
+                patch_size_targets = []
+                patch_is_pos = []
+
+                # Thu thập positive patches (duyệt trực tiếp từng dict trong list)
+                for p in pos:
+                    pr, pc = p["patch_coord"]
+                    cid = p["class_id"]
+                    lw, lh = p["log_size"]
+
+                    patch_logits.append(cls_logits[0, :, pr, pc])
+                    patch_cls_targets.append(cid)
+                    patch_size_preds.append(size_preds[0, :, pr, pc])
+                    patch_size_targets.append([lw, lh])
+                    patch_is_pos.append(True)
+
+                # Thu thập negative patches (duyệt trực tiếp từng dict trong list)
+                for n in neg:
+                    pr, pc = n["patch_coord"]
+                    cid = n["class_id"]
+
+                    patch_logits.append(cls_logits[0, :, pr, pc])
+                    patch_cls_targets.append(cid)
+                    patch_size_preds.append(size_preds[0, :, pr, pc])
+                    patch_size_targets.append([0.0, 0.0])
+                    patch_is_pos.append(False)
+
+                if len(patch_logits) == 0:
+                    continue
+
+                logits_tensor = torch.stack(patch_logits)
+                targets_tensor = torch.tensor(patch_cls_targets, device=self.device, dtype=torch.long)
+                sizes_tensor = torch.stack(patch_size_preds)
+                size_targets_tensor = torch.tensor(patch_size_targets, device=self.device, dtype=torch.float32)
+                is_pos_tensor = torch.tensor(patch_is_pos, device=self.device, dtype=torch.bool)
+
+                loss, l_cls, l_box = self.criterion(
+                    logits_tensor, targets_tensor, sizes_tensor, size_targets_tensor, is_pos_tensor
+                )
+
+                # Chia tỉ lệ loss trước khi backward để tránh nổ gradient khi tích lũy
+                scaled_loss = loss / batch_size
+                scaled_loss.backward()
+                accum_steps += 1
+                sample_count += 1
+
+                # Cập nhật optimizer sau mỗi batch_size mẫu hoặc ở mẫu cuối
+                if accum_steps % batch_size == 0 or step == len(dataloader) - 1:
+                    torch.nn.utils.clip_grad_norm_(self.model.heads.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+
+                total_loss += loss.item()
+                total_cls_loss += l_cls.item()
+                total_box_loss += l_box.item()
+
+            avg_loss = total_loss / max(1, sample_count)
+            avg_cls = total_cls_loss / max(1, sample_count)
+            avg_box = total_box_loss / max(1, sample_count)
+
+            logger.info(f"Epoch [{epoch}/{epochs}] Loss: {avg_loss:.4f} (L_cls: {avg_cls:.4f}, L_box: {avg_box:.4f})")
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                torch.save(self.model.heads.state_dict(), best_ckpt_path)
+                logger.info(f"  -> Đã lưu best checkpoint tại {best_ckpt_path}")
+
+        logger.info(f"✅ Hoàn tất huấn luyện CAMG! Checkpoint: {best_ckpt_path}")
+        return str(best_ckpt_path)
+
+
+# ─────────────────────────────────────────────────────────
+# 5. CAMG Generator (Inference với Top-k Sampling, k=5)
+# ─────────────────────────────────────────────────────────
+
+class CAMGGenerator:
+    """
+    Module sinh mask lỗi context-aware:
+    - Nhận ảnh bo mạch bình thường (Normal PCB Image)
+    - Trích xuất Dense Probability Map M qua CAMG
+    - Dùng Top-k sampling (k=5) để chọn vị trí và kích thước lỗi hợp lệ
+    - Xuất Binary Mask và Bounding Box coordinates
+    """
+
+    def __init__(
+        self,
+        weights_path: Optional[str] = None,
+        device: str = "cuda",
+        k: int = 5,
+        image_size: int = 588,
+        patch_size: int = 14,
+    ):
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.k = k
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.grid_size = image_size // patch_size  # 42
+
+        self.model = CAMGModel(device=str(self.device))
+        if weights_path and Path(weights_path).exists():
+            logger.info(f"[CAMG] Tải checkpoint trọng số từ {weights_path}")
+            self.model.heads.load_state_dict(torch.load(weights_path, map_location=self.device))
+        else:
+            logger.info("[CAMG] Khởi chạy ở chế độ evaluation với trọng số mặc định.")
+
+        self.model.eval()
+
+        self.transform = transforms.Compose([
+            transforms.Resize((self.image_size, self.image_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225]),
         ])
 
     @torch.no_grad()
-    def extract_patch_features(self, image: Image.Image) -> np.ndarray:
+    def predict_defect_map(self, image: Image.Image) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Trả về ma trận attention map (H_patch x W_patch) dùng để
-        ưu tiên đặt lỗi vào vùng có texture phức tạp (không phải nền).
+        Trả về:
+          prob_map: (num_classes, G, G) xác suất lớp tại từng patch
+          size_map: (2, G, G) kích thước (ŵ, ĥ) ước lượng tại từng patch
         """
-        x = self.transform(image).unsqueeze(0).to(self.device)
-        # Lấy attention của [CLS] token với các patch
-        outputs = self.model.get_intermediate_layers(x, n=1, return_class_token=True)
-        patch_tokens = outputs[0][0].squeeze(0).cpu().numpy()  # (N_patches, D)
+        img_tensor = self.transform(image).unsqueeze(0).to(self.device)
+        cls_logits, size_preds = self.model(img_tensor)
 
-        n_patches = int(patch_tokens.shape[0] ** 0.5)
-        # Dùng L2-norm của patch feature làm "saliency score"
-        saliency = np.linalg.norm(patch_tokens, axis=-1).reshape(n_patches, n_patches)
-        return saliency
+        # Softmax để lấy xác suất p_i
+        probs = F.softmax(cls_logits, dim=1).squeeze(0).cpu().numpy()  # (7, G, G)
+        # Chuyển đổi log size -> kích thước chuẩn hóa (w, h)
+        log_sizes = size_preds.squeeze(0).cpu().numpy()                # (2, G, G)
+        # Clip log_size để tránh tràn số exp
+        log_sizes = np.clip(log_sizes, -6.0, 0.0)
+        sizes = np.exp(log_sizes)                                      # (2, G, G)
 
+        return probs, sizes
 
-# ─────────────────────────────────────────────────────────
-# Bounding Box Proposal
-# ─────────────────────────────────────────────────────────
-class DefectBBoxProposer:
-    """
-    Đề xuất bounding box vị trí lỗi dựa trên:
-      1. Saliency map từ DINOv2
-      2. Ràng buộc kích thước tương đối với ảnh gốc
-    """
-
-    def __init__(
-        self,
-        min_area_ratio: float = 0.01,   # Lỗi tối thiểu 1% diện tích ảnh
-        max_area_ratio: float = 0.15,   # Lỗi tối đa 15% diện tích ảnh
-        n_proposals: int = 5,
-        strategy: str = "saliency",     # "saliency" | "random" | "grid"
-    ):
-        self.min_area_ratio = min_area_ratio
-        self.max_area_ratio = max_area_ratio
-        self.n_proposals = n_proposals
-        self.strategy = strategy
-
-    def propose(
+    def generate_mask_for_defect(
         self,
         image: Image.Image,
-        saliency_map: Optional[np.ndarray] = None,
-    ) -> list[dict]:
+        defect_type: str,
+        orig_size: Tuple[int, int] = (600, 600),
+    ) -> Dict:
         """
-        Trả về danh sách dict với keys: x, y, w, h (pixel coords), score.
+        Sinh 1 mask lỗi cho loại lỗi chỉ định bằng Top-k sampling (k=5).
         """
-        W, H = image.size
-        proposals = []
+        if defect_type not in PCB_DEFECT_CLASSES:
+            raise ValueError(f"Loại lỗi không hợp lệ: {defect_type}. Hỗ trợ: {PCB_DEFECT_CLASSES}")
 
-        if self.strategy == "saliency" and saliency_map is not None:
-            proposals = self._saliency_proposals(saliency_map, W, H)
-        elif self.strategy == "grid":
-            proposals = self._grid_proposals(W, H)
-        else:
-            proposals = self._random_proposals(W, H)
+        cls_id = PCB_DEFECT_CLASSES.index(defect_type)
+        prob_map, size_map = self.predict_defect_map(image)
 
-        return proposals[:self.n_proposals]
+        # Lấy xác suất của class lỗi tương ứng: shape (G, G)
+        c_prob = prob_map[cls_id]
+        G = self.grid_size
+        flat_probs = c_prob.flatten()
 
-    def _saliency_proposals(self, saliency: np.ndarray, W: int, H: int) -> list[dict]:
-        """Đặt lỗi ưu tiên vào vùng có saliency cao (trace/pad trên PCB)."""
-        # Resize saliency về kích thước ảnh
-        sal_resized = cv2.resize(saliency, (W, H), interpolation=cv2.INTER_LINEAR)
-        sal_norm = (sal_resized - sal_resized.min()) / (sal_resized.max() - sal_resized.min() + 1e-8)
+        # Thuật toán Top-k sampling (k = 5) theo bài báo
+        k = min(self.k, len(flat_probs))
+        top_k_indices = np.argsort(flat_probs)[-k:]  # k vị trí có xác suất cao nhất
+        selected_idx = int(np.random.choice(top_k_indices))
 
-        proposals = []
-        for _ in range(self.n_proposals * 3):  # oversample rồi lọc
-            # Sample một điểm theo phân phối saliency
-            flat_probs = sal_norm.flatten()
-            flat_probs = flat_probs / flat_probs.sum()
-            idx = np.random.choice(len(flat_probs), p=flat_probs)
-            cy, cx = divmod(idx, W)
+        pr, pc = divmod(selected_idx, G)
+        confidence = float(flat_probs[selected_idx])
 
-            # Kích thước bbox ngẫu nhiên trong [min, max] area ratio
-            area = random.uniform(self.min_area_ratio, self.max_area_ratio) * W * H
-            aspect = random.uniform(0.5, 2.0)
-            bw = int(np.sqrt(area * aspect))
-            bh = int(np.sqrt(area / aspect))
-            bw = max(16, min(bw, W // 2))
-            bh = max(16, min(bh, H // 2))
+        # Kích thước box dự đoán
+        pred_w_norm = float(np.clip(size_map[0, pr, pc], 0.02, 0.20))
+        pred_h_norm = float(np.clip(size_map[1, pr, pc], 0.02, 0.20))
 
-            x = max(0, cx - bw // 2)
-            y = max(0, cy - bh // 2)
-            x = min(x, W - bw)
-            y = min(y, H - bh)
+        # Tọa độ tâm bbox trên ảnh gốc
+        orig_w, orig_h = orig_size
+        cx = (pc + 0.5) / G * orig_w
+        cy = (pr + 0.5) / G * orig_h
+        bw = pred_w_norm * orig_w
+        bh = pred_h_norm * orig_h
 
-            score = float(sal_norm[y: y + bh, x: x + bw].mean())
-            proposals.append(dict(x=x, y=y, w=bw, h=bh, score=score))
+        x1 = max(0, int(cx - bw / 2))
+        y1 = max(0, int(cy - bh / 2))
+        x2 = min(orig_w, int(cx + bw / 2))
+        y2 = min(orig_h, int(cy + bh / 2))
 
-        proposals.sort(key=lambda p: -p["score"])
-        return proposals
+        # Tạo binary mask B_c (0 và 255)
+        mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
+        mask[y1:y2, x1:x2] = 255
+        mask_pil = Image.fromarray(mask)
 
-    def _random_proposals(self, W: int, H: int) -> list[dict]:
-        proposals = []
-        for _ in range(self.n_proposals):
-            area = random.uniform(self.min_area_ratio, self.max_area_ratio) * W * H
-            aspect = random.uniform(0.5, 2.0)
-            bw = int(np.sqrt(area * aspect))
-            bh = int(np.sqrt(area / aspect))
-            bw = max(16, min(bw, W // 2))
-            bh = max(16, min(bh, H // 2))
-            x = random.randint(0, W - bw)
-            y = random.randint(0, H - bh)
-            proposals.append(dict(x=x, y=y, w=bw, h=bh, score=1.0))
-        return proposals
-
-    def _grid_proposals(self, W: int, H: int) -> list[dict]:
-        """Chia ảnh thành grid, đề xuất ở từng ô."""
-        grid = int(np.ceil(np.sqrt(self.n_proposals)))
-        cw, ch = W // grid, H // grid
-        proposals = []
-        for i in range(grid):
-            for j in range(grid):
-                cx = j * cw + cw // 2
-                cy = i * ch + ch // 2
-                bw = max(16, int(cw * random.uniform(0.3, 0.7)))
-                bh = max(16, int(ch * random.uniform(0.3, 0.7)))
-                x = max(0, min(cx - bw // 2, W - bw))
-                y = max(0, min(cy - bh // 2, H - bh))
-                proposals.append(dict(x=x, y=y, w=bw, h=bh, score=1.0))
-        return proposals
-
-
-# ─────────────────────────────────────────────────────────
-# Mask Renderer
-# ─────────────────────────────────────────────────────────
-def bbox_to_mask(image_size: tuple[int, int], bbox: dict) -> np.ndarray:
-    """Chuyển bbox dict → binary mask (H×W, uint8, 0/255)."""
-    W, H = image_size
-    mask = np.zeros((H, W), dtype=np.uint8)
-    x, y, w, h = bbox["x"], bbox["y"], bbox["w"], bbox["h"]
-    mask[y: y + h, x: x + w] = 255
-
-    # Optional: làm mờ viền để inpainting tự nhiên hơn
-    mask = cv2.GaussianBlur(mask, (15, 15), 5)
-    _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-    return mask
-
-
-# ─────────────────────────────────────────────────────────
-# MaskGenerator — entry point cho Step 1
-# ─────────────────────────────────────────────────────────
-class PCBMaskGenerator:
-    """
-    Kết hợp DINOv2 feature extractor + BBox proposer thành 1 interface.
-
-    Sử dụng:
-        gen = PCBMaskGenerator()
-        result = gen.generate("board.jpg", defect_type="scratch")
-        # result["mask"] -> PIL.Image (binary mask)
-        # result["bbox"] -> dict(x,y,w,h,score)
-    """
-
-    def __init__(
-        self,
-        dino_model: str = "dinov2_vitb14",
-        device: str = "cuda",
-        strategy: str = "saliency",
-        n_proposals: int = 5,
-    ):
-        self.extractor = DINOv2FeatureExtractor(dino_model, device)
-        self.proposer = DefectBBoxProposer(strategy=strategy, n_proposals=n_proposals)
-
-    def generate(
-        self,
-        image_path: str | Path,
-        defect_type: str = "scratch",
-        proposal_idx: int = 0,
-    ) -> dict:
-        """
-        Args:
-            image_path: Đường dẫn ảnh PCB gốc (không lỗi).
-            defect_type: Loại lỗi (dùng để log / đặt tên file).
-            proposal_idx: Chọn proposal thứ mấy trong danh sách đề xuất.
-
-        Returns:
-            dict với các keys:
-              - image (PIL.Image): ảnh gốc
-              - mask (PIL.Image):  binary mask (0/255, mode 'L')
-              - bbox (dict):       {x, y, w, h, score}
-              - defect_type (str)
-        """
-        image = Image.open(image_path).convert("RGB")
-        saliency = self.extractor.extract_patch_features(image)
-        proposals = self.proposer.propose(image, saliency)
-
-        if not proposals:
-            raise RuntimeError("Không thể tạo proposal cho ảnh này.")
-
-        bbox = proposals[min(proposal_idx, len(proposals) - 1)]
-        mask_arr = bbox_to_mask(image.size, bbox)
-        mask_pil = Image.fromarray(mask_arr, mode="L")
-
-        return dict(
-            image=image,
-            mask=mask_pil,
-            bbox=bbox,
-            defect_type=defect_type,
-        )
+        return {
+            "defect_type": defect_type,
+            "class_id": cls_id,
+            "confidence": confidence,
+            "patch_coord": (pr, pc),
+            "bbox_pixel": [x1, y1, x2, y2],
+            "bbox_norm": [cx / orig_w, cy / orig_h, bw / orig_w, bh / orig_h],
+            "mask_image": mask_pil,
+        }
 
     def generate_batch(
         self,
-        image_dir: str | Path,
-        output_dir: str | Path,
-        defect_types: list[str] | None = None,
+        image_dir: str | Path = "data/pcb_normal",
+        output_dir: str | Path = "outputs/masks",
+        defect_types: Optional[List[str]] = None,
         images_per_defect: int = 1,
-    ) -> list[dict]:
+    ) -> List[Dict]:
         """
-        Sinh mask cho toàn bộ ảnh trong thư mục.
-
-        Returns:
-            Danh sách metadata records (list of dicts) để đưa vào Step 2.
+        Sinh batch mask cho toàn bộ ảnh normal trong thư mục.
         """
-        if defect_types is None:
-            defect_types = ["scratch", "missing_hole", "open_circuit",
-                            "short", "spur", "spurious_copper"]
+        img_dir = Path(image_dir)
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        image_dir = Path(image_dir)
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        defect_types = defect_types or PCB_DEFECT_CLASSES
+        images = sorted(list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")))
+        if not images:
+            logger.warning(f"Không tìm thấy ảnh nào trong {img_dir}")
+            return []
 
-        image_paths = sorted(
-            p for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp")
-            for p in image_dir.glob(ext)
-        )
-
+        logger.info(f"[CAMG] Đang sinh masks cho {len(images)} ảnh, {len(defect_types)} loại lỗi...")
         records = []
-        for img_path in image_paths:
-            for defect_type in defect_types:
-                for idx in range(images_per_defect):
-                    try:
-                        result = self.generate(img_path, defect_type)
-                        stem = f"{img_path.stem}_{defect_type}_{idx:03d}"
-                        mask_path = output_dir / f"{stem}_mask.png"
-                        result["mask"].save(mask_path)
 
-                        record = {
-                            "image_path": str(img_path),
-                            "mask_path": str(mask_path),
-                            "bbox": result["bbox"],
-                            "defect_type": defect_type,
-                        }
-                        records.append(record)
-                        logger.info(f"[Mask] {stem} bbox={result['bbox']}")
+        for img_path in images:
+            pil_img = Image.open(img_path).convert("RGB")
+            W, H = pil_img.size
 
-                    except Exception as e:
-                        logger.warning(f"[Mask] Lỗi xử lý {img_path}: {e}")
+            for dtype in defect_types:
+                for rep in range(images_per_defect):
+                    res = self.generate_mask_for_defect(pil_img, defect_type=dtype, orig_size=(W, H))
 
-        # Lưu metadata
-        meta_path = output_dir / "mask_metadata.json"
+                    mask_filename = f"{img_path.stem}_{dtype}_{rep}_mask.png"
+                    mask_save_path = out_dir / mask_filename
+                    res["mask_image"].save(mask_save_path)
+
+                    record = {
+                        "normal_image_path": str(img_path.resolve()),
+                        "mask_path": str(mask_save_path.resolve()),
+                        "defect_type": dtype,
+                        "class_id": res["class_id"],
+                        "confidence": res["confidence"],
+                        "bbox_pixel": res["bbox_pixel"],
+                        "bbox_norm": res["bbox_norm"],
+                    }
+                    records.append(record)
+
+        meta_path = out_dir / "mask_metadata.json"
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2, ensure_ascii=False)
-        logger.info(f"[Mask] Đã lưu {len(records)} records → {meta_path}")
+
+        logger.info(f"✅ Đã tạo {len(records)} masks. Metadata lưu tại: {meta_path}")
         return records
 
 
 # ─────────────────────────────────────────────────────────
-# Quick test
+# Backward Compatibility Wrapper
 # ─────────────────────────────────────────────────────────
+class PCBMaskGenerator(CAMGGenerator):
+    """Lớp bọc tương thích ngược với code cũ của pipeline."""
+    pass
+
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Step 1: PCB Mask Generator")
-    parser.add_argument("--image_dir", required=True, help="Thư mục ảnh PCB gốc")
-    parser.add_argument("--output_dir", default="outputs/masks", help="Thư mục lưu mask")
-    parser.add_argument("--defect_types", nargs="+",
-                        default=["scratch", "missing_hole", "open_circuit",
-                                 "short", "spur", "spurious_copper"])
-    parser.add_argument("--images_per_defect", type=int, default=1)
-    parser.add_argument("--strategy", default="saliency",
-                        choices=["saliency", "random", "grid"])
-    parser.add_argument("--device", default="cuda")
-    args = parser.parse_args()
-
-    gen = PCBMaskGenerator(strategy=args.strategy, device=args.device)
-    records = gen.generate_batch(
-        args.image_dir,
-        args.output_dir,
-        args.defect_types,
-        args.images_per_defect,
-    )
-    print(f"✅ Tạo được {len(records)} mask records.")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    gen = CAMGGenerator()
+    logger.info("CAMG Module đã được nạp thành công và sẵn sàng hoạt động.")

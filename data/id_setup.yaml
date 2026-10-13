@@ -1,0 +1,7 @@
+# In-Distribution (ID) Dataset Config (10% Low-Data)
+path: .
+train: data/prepared_splits/id_train_low.txt
+val: data/prepared_splits/id_val.txt
+
+nc: 6
+names: ['mouse_bite', 'spur', 'missing_hole', 'short', 'open_circuit', 'spurious_copper']

@@ -1,0 +1,8 @@
+# New Product Introduction (NPI) Dataset Config
+# Train trên Seen Products, Val trên 100% Unseen Products
+path: .
+train: data/prepared_splits/npi_train_low.txt
+val: data/prepared_splits/npi_val_unseen.txt
+
+nc: 6
+names: ['mouse_bite', 'spur', 'missing_hole', 'short', 'open_circuit', 'spurious_copper']

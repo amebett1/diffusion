@@ -1,164 +1,140 @@
-# PCB Defect Synthesis Pipeline
+# PCB Defect Image Synthesis & Quality Filter Pipeline
 
-Pipeline sinh ảnh lỗi PCB tổng hợp dựa trên **DINOv2 + Stable Diffusion Inpainting + LoRA + YOLO11**.
+Triển khai hoàn chỉnh theo bài báo:
+> **"A Synthetic Defect Image Generation Method for Enhanced Industrial Defect Detection Based on Inpainting Diffusion and Context-aware Mask Generation"**
+> *Journal of Intelligent Manufacturing (POSTECH, 2026)*
 
-## Kiến trúc tổng quan
+---
 
-```
-data/pcb_normal/          data/pcb_real_defects/
-      │                          │
-      ▼                          ▼
-┌─────────────┐          ┌───────────────────┐
-│  STEP 1     │          │  LoRA Fine-tune   │
-│  DINOv2     │          │  (LoRA rank=8     │
-│  Mask Gen   │          │   alpha=16        │
-│  + BBox     │          │   10 epoch        │
-└──────┬──────┘          │   batch=32)       │
-       │ mask_metadata   └────────┬──────────┘
-       ▼                         │ lora_ckpt
-┌─────────────────────────────────┴──────┐
-│  STEP 2  — SD Inpainting + LoRA + TI  │
-│  • Textual Inversion: <pcb-defect>     │
-│  • Defect-aware loss (λ=2.0)          │
-│  • 50 denoising steps (~4s/ảnh)       │
-└───────────────────┬────────────────────┘
-                    │ generated_metadata
-                    ▼
-          ┌──────────────────┐
-          │  STEP 3          │
-          │  YOLO11 Judge    │
-          │  → Loại 25%      │
-          │    confidence    │
-          │    thấp nhất     │
-          └────────┬─────────┘
-                   │
-                   ▼
-         outputs/filtered/accepted/
-         (~829 ảnh PCB tổng hợp)
-```
+## 📌 Kiến trúc 3 bước cốt lõi
 
-## Cài đặt
+1. **Step 1 — Context-Aware Mask Generation (CAMG)**:
+   - Backbone DINOv2 ViT-B/14 (Frozen).
+   - Dự đoán phân loại patch-wise (7 classes) và kích thước bounding box (log w, log h).
+   - Cơ chế lấy mẫu Top-k (k = 5) xác định vị trí khuyết tật tự nhiên nhất.
+2. **Step 2 — Inpainting Diffusion + LoRA + Textual Inversion**:
+   - Kiến trúc Stable Diffusion Inpainting (U-Net 9 kênh).
+   - Parameter-Efficient Fine-Tuning: LoRA ($r=8, \alpha=16$) cho Attention và Output projections.
+   - 6 tokens học riêng biệt qua Textual Inversion cho 6 loại lỗi PCB.
+   - Hàm mất mát kép Dual-Loss ($\mathcal{L}_{\text{tot}} = \mathcal{L}_{\text{def}} + \lambda \mathcal{L}_{\text{rec}}$, $\lambda = 0.1$).
+   - 50 bước DDIM Scheduler kết hợp cơ chế **Latent Overwriting** bảo toàn 100% cấu trúc bo mạch nền.
+3. **Step 3 — Confidence-based Quality Filtering (YOLO11s Judge)**:
+   - Huấn luyện mô hình phát hiện YOLO11s (100 epochs, AdamW optimizer, cosine lr scheduling).
+   - Chấm điểm chất lượng có đối chiếu mục tiêu (Target-aware IoU matching $\ge 0.1$).
+   - Quy tắc loại bỏ: Loại 25% ảnh confidence thấp nhất, giữ lại 75% ảnh đạt chuẩn.
+   - Tự động xuất nhãn bounding box chuẩn YOLO (`.txt`) và sinh file `augmented_dataset.yaml` cho Downstream Benchmark.
 
+---
+
+## 🛠️ Hướng dẫn cài đặt & Thiết lập dữ liệu
+
+### 1. Clone mã nguồn (Siêu nhẹ < 2 MB)
 ```bash
+git clone <repository_url>
+cd diffusion
 pip install -r requirements.txt
 ```
 
-## Cách dùng
+### 2. Thiết lập dữ liệu (`data/`)
+Do dung lượng ảnh lớn (~1.2 GB), dữ liệu được chia sẻ riêng qua Google Drive:
+- Tải file **`diffusion_colab.zip`** từ Google Drive.
+- Giải nén vào thư mục dự án sao cho cấu trúc như sau:
 
-### Chạy toàn bộ pipeline
-
-```bash
-python run_pipeline.py full \
-    --image_dir       data/pcb_normal \
-    --real_defect_dir data/pcb_real_defects \
-    --output_dir      outputs/pcb_synthesis \
-    --device          cuda
+```text
+data/
+├── pcb-defect-dataset/        # Ảnh và nhãn DeepPCB gốc (train, val, test)
+├── pcb_normal/                # 799 ảnh phôi PCB sạch không lỗi
+├── prepared_splits/           # Danh sách file chia tập ID và NPI
+├── id_setup.yaml              # Cấu hình YOLO kịch bản In-Distribution (10% low-data)
+├── npi_setup.yaml             # Cấu hình YOLO kịch bản New Product Introduction
+├── train_metadata.json        # Metadata huấn luyện CAMG và LoRA
+└── dataset_stats.json         # Thống kê phân vị Q1/Q3 kích thước khuyết tật
 ```
 
-### Dùng LoRA checkpoint đã train sẵn
+> **Lưu ý về đường dẫn:** Toàn bộ cấu hình và file txt đều sử dụng **đường dẫn tương đối (`data/...`)**, cho phép dự án chạy được trên bất kỳ máy tính nào (Windows, macOS, Linux, Google Colab) mà không cần cấu hình lại!
 
+---
+
+## 🚀 Cách chạy Pipeline
+
+### Cách 1: Chạy trực tiếp trên Google Colab với GPU (Khuyên dùng)
+Dự án đã tích hợp sẵn notebook [run_on_colab.ipynb](file:///c:/Users/Lenovo/Downloads/diffusion/diffusion/run_on_colab.ipynb):
+1. Tải `diffusion_colab.zip` lên Google Drive của bạn.
+2. Mở file `run_on_colab.ipynb` trên Google Colab, bật GPU (T4 hoặc A100).
+3. Bấm **Run all** để tự động giải nén, huấn luyện toàn bộ và lưu kết quả về Google Drive!
+
+---
+
+### Cách 2: Chạy toàn bộ Pipeline bằng Command Line (One-Click Full)
 ```bash
 python run_pipeline.py full \
-    --image_dir    data/pcb_normal \
-    --lora_ckpt    outputs/lora_checkpoints/epoch_010 \
-    --yolo_weights outputs/yolo_training/pcb_defect_judge/weights/best.pt \
-    --output_dir   outputs/pcb_synthesis
+    --image_dir data/pcb_normal \
+    --real_defect_dir data/pcb-defect-dataset \
+    --metadata_path data/train_metadata.json \
+    --data_yaml data/id_setup.yaml \
+    --output_dir outputs/pcb_synthesis \
+    --lora_epochs 10 \
+    --lora_batch 32 \
+    --inpaint_steps 50 \
+    --guidance 7.5 \
+    --yolo_size s \
+    --yolo_epochs 100 \
+    --reject_ratio 0.25 \
+    --device cuda
 ```
 
-### Chạy từng bước riêng
+---
 
+### Cách 3: Chạy từng bước độc lập
+
+#### Bước 1: Sinh Mask bằng CAMG
 ```bash
-# Bước 1: Tạo mask
 python run_pipeline.py step1 \
     --image_dir data/pcb_normal \
-    --output_dir outputs
+    --output_dir outputs \
+    --k 5 \
+    --images_per_defect 1
+```
 
-# Bước 2a: Train LoRA (cần real defect data)
+#### Bước 2a: Huấn luyện LoRA + Textual Inversion
+```bash
 python run_pipeline.py step2_train \
-    --real_defect_dir data/pcb_real_defects \
-    --output_dir outputs
+    --metadata_path data/train_metadata.json \
+    --output_dir outputs \
+    --lora_epochs 10 \
+    --lora_batch 32 \
+    --device cuda
+```
 
-# Bước 2b: Sinh ảnh
+#### Bước 2b: Sinh ảnh khuyết tật tổng hợp
+```bash
 python run_pipeline.py step2_generate \
-    --mask_meta  outputs/masks/mask_metadata.json \
-    --lora_ckpt  outputs/lora_checkpoints/epoch_010 \
-    --output_dir outputs
+    --mask_meta outputs/masks/mask_metadata.json \
+    --lora_ckpt outputs/lora_checkpoints/epoch_010 \
+    --output_dir outputs \
+    --inpaint_steps 50 \
+    --device cuda
+```
 
-# Bước 3: Lọc ảnh
+#### Bước 3: Huấn luyện YOLO11 Judge & Lọc chất lượng
+```bash
 python run_pipeline.py step3 \
-    --gen_meta     outputs/generated/generated_metadata.json \
-    --yolo_weights outputs/yolo_training/.../best.pt \
-    --output_dir   outputs/filtered
+    --gen_meta outputs/generated/generated_metadata.json \
+    --data_yaml data/id_setup.yaml \
+    --output_dir outputs \
+    --yolo_size s \
+    --yolo_epochs 100 \
+    --reject_ratio 0.25 \
+    --device cuda
 ```
 
-## Cấu trúc dữ liệu
+---
 
-### Input — Ảnh lỗi thực (để train LoRA + YOLO11)
+## 📋 6 loại lỗi PCB chuẩn DeepPCB (Paper Standard)
 
-```
-data/pcb_real_defects/
-├── scratch/
-│   ├── img001.jpg
-│   └── ...
-├── missing_hole/
-├── open_circuit/
-├── short/
-├── spur/
-└── spurious_copper/
-```
-
-> **Lưu ý**: Thư mục `pcb_real_defects/` cần có thêm `train_metadata.json`:
-> ```json
-> [
->   {
->     "image_path": "data/pcb_real_defects/scratch/img001.jpg",
->     "mask_path":  "data/pcb_real_defects/scratch/img001_mask.png",
->     "defect_type": "scratch"
->   }
-> ]
-> ```
-
-### Output
-
-```
-outputs/pcb_synthesis/
-├── masks/
-│   ├── *_mask.png          ← Binary masks từ Step 1
-│   └── mask_metadata.json
-├── generated/
-│   ├── *.png               ← Ảnh lỗi tổng hợp từ Step 2
-│   └── generated_metadata.json
-├── filtered/
-│   ├── accepted/
-│   │   └── *.png           ← 75% ảnh chất lượng cao
-│   ├── accepted_metadata.json
-│   └── rejected_metadata.json
-├── lora_checkpoints/
-│   └── epoch_010/
-│       ├── pytorch_lora_weights.safetensors
-│       └── ti_embedding.pt
-├── pipeline_config.json
-└── pipeline_report.json
-```
-
-## Thiết lập theo bài báo
-
-| Thành phần | Giá trị |
-|---|---|
-| LoRA Rank | 8 |
-| LoRA Alpha | 16 |
-| Epochs | 10 |
-| Batch size | 32 |
-| Denoising steps | 50 |
-| Thời gian tạo ảnh | ~4s/ảnh |
-| Ảnh PCB tổng hợp | 829 ảnh |
-| Lọc | 25% confidence thấp nhất |
-
-## Loại lỗi PCB được hỗ trợ
-
-- `scratch` — Trầy xước
-- `missing_hole` — Thiếu lỗ
-- `open_circuit` — Đứt mạch
-- `short` — Ngắn mạch
-- `spur` — Lồi bất thường
-- `spurious_copper` — Đồng thừa
+1. `mouse_bite` (Vết cắn góc)
+2. `spur` (Gờ lồi/via kim)
+3. `missing_hole` (Thiếu lỗ khoan)
+4. `short` (Ngắn mạch/chập)
+5. `open_circuit` (Đứt mạch)
+6. `spurious_copper` (Đồng thừa)

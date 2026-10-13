@@ -23,19 +23,19 @@ Chạy từng bước riêng:
     python run_pipeline.py step3 --gen_meta outputs/generated/generated_metadata.json ...
 """
 
+import sys
 import argparse
 import json
 import logging
 import time
 from pathlib import Path
 
-from pcb_pipeline.step1_mask_generator import PCBMaskGenerator
-from pcb_pipeline.step2_lora_inpainting import PCBDefectInpainter, LoRAInpaintTrainer
-from pcb_pipeline.step3_quality_filter import (
-    YOLO11DefectTrainer,
-    YOLO11ConfidenceScorer,
-    QualityFilter,
-)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
+from pcb_pipeline.step1_mask_generator import PCBMaskGenerator, CAMGGenerator, CAMGTrainer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,11 +49,11 @@ logger = logging.getLogger(__name__)
 # Shared config / defaults
 # ─────────────────────────────────────────────────────────
 PCB_DEFECT_TYPES = [
-    "scratch",
-    "missing_hole",
-    "open_circuit",
-    "short",
+    "mouse_bite",
     "spur",
+    "missing_hole",
+    "short",
+    "open_circuit",
     "spurious_copper",
 ]
 
@@ -63,18 +63,22 @@ DEFAULT_CONFIG = {
     "mask_strategy":     "saliency",       # saliency | random | grid
     "n_proposals":       5,
     "images_per_defect": 1,
-    # Step 2 — LoRA
+    # Step 2 — LoRA & TI
     "lora_rank":         8,
     "lora_alpha":        16.0,
     "lora_epochs":       10,
     "lora_batch":        32,
+    "lr_unet":           1e-4,
+    "lr_text_encoder":   5e-5,
+    "lr_ti":             5e-4,
     # Step 2 — Inference
     "inpaint_steps":     50,               # ~4 giây/ảnh
     "guidance_scale":    7.5,
+    "negative_prompt":   "blurry, low quality, deformed, ugly, watermark, signature, text, logo",
     # Step 3
     "reject_ratio":      0.25,             # Loại 25%
-    "yolo_size":         "n",
-    "yolo_epochs":       50,
+    "yolo_size":         "s",              # YOLO11s chuẩn theo bài báo
+    "yolo_epochs":       100,              # 100 epochs chuẩn theo trang 8 bài báo
     "device":            "cuda",
 }
 
@@ -98,73 +102,103 @@ def save_config(cfg: dict, output_dir: Path):
 
 
 # ─────────────────────────────────────────────────────────
-# STEP 1: Mask Generation
+# STEP 1: Mask Generation (CAMG)
 # ─────────────────────────────────────────────────────────
+def run_step1_train(args, cfg: dict) -> str:
+    logger.info("=" * 60)
+    logger.info("STEP 1a — Huấn luyện CAMG Module (Prediction Heads)")
+    logger.info("=" * 60)
+    meta_path = getattr(args, "metadata_path", "data/train_metadata.json")
+    epochs = getattr(args, "epochs", 10)
+    batch_size = getattr(args, "batch_size", 32)
+    lr = getattr(args, "lr", 1e-4)
+
+    trainer = CAMGTrainer(device=cfg["device"], lr=lr)
+    ckpt = trainer.train(metadata_path=meta_path, epochs=epochs, batch_size=batch_size)
+    logger.info(f"✅ Huấn luyện CAMG hoàn tất -> {ckpt}")
+    return ckpt
+
+
 def run_step1(args, cfg: dict) -> list[dict]:
     logger.info("=" * 60)
-    logger.info("STEP 1 — Tạo mask lỗi bằng DINOv2")
+    logger.info("STEP 1b — Sinh Mask lỗi bằng CAMG (Top-k Sampling)")
     logger.info("=" * 60)
 
     output_dir = Path(args.output_dir) / "masks"
-    gen = PCBMaskGenerator(
-        dino_model=cfg["dino_model"],
+    weights_path = getattr(args, "camg_weights", None)
+    k = getattr(args, "k", 5)
+
+    gen = CAMGGenerator(
+        weights_path=weights_path,
         device=cfg["device"],
-        strategy=cfg["mask_strategy"],
-        n_proposals=cfg["n_proposals"],
+        k=k,
     )
     records = gen.generate_batch(
         image_dir=args.image_dir,
         output_dir=output_dir,
         defect_types=args.defect_types or PCB_DEFECT_TYPES,
-        images_per_defect=cfg["images_per_defect"],
+        images_per_defect=getattr(args, "images_per_defect", 1),
     )
     logger.info(f"✅ Step 1 xong: {len(records)} mask records")
     return records
 
 
 # ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 # STEP 2a: LoRA Training (nếu chưa có checkpoint)
 # ─────────────────────────────────────────────────────────
 def run_step2_train(args, cfg: dict):
-    if not args.real_defect_dir:
-        logger.warning("[Step 2 Train] Bỏ qua: không có --real_defect_dir")
-        return
+    # Xác định đường dẫn train_metadata.json
+    metadata_path = getattr(args, "metadata_path", None)
+    if not metadata_path or not Path(metadata_path).exists():
+        if getattr(args, "real_defect_dir", None):
+            alt = Path(args.real_defect_dir) / "train_metadata.json"
+            if alt.exists():
+                metadata_path = str(alt)
+        if not metadata_path or not Path(metadata_path).exists():
+            default_meta = Path("data/train_metadata.json")
+            if default_meta.exists():
+                metadata_path = str(default_meta)
+
+    if not metadata_path or not Path(metadata_path).exists():
+        logger.warning("[Step 2 Train] Bỏ qua: không tìm thấy file train_metadata.json!")
+        return None
 
     logger.info("=" * 60)
-    logger.info("STEP 2a — Fine-tune LoRA + Textual Inversion")
+    logger.info("STEP 2a — Fine-tune LoRA (U-Net & Text Encoder) + Textual Inversion")
     logger.info(f"  rank={cfg['lora_rank']}  alpha={cfg['lora_alpha']}")
     logger.info(f"  epochs={cfg['lora_epochs']}  batch={cfg['lora_batch']}")
+    logger.info(f"  lr_unet={cfg['lr_unet']}  lr_text_encoder={cfg['lr_text_encoder']}  lr_ti={cfg['lr_ti']}")
+    logger.info(f"  metadata={metadata_path}")
     logger.info("=" * 60)
 
     lora_out = Path(args.output_dir) / "lora_checkpoints"
+    from pcb_pipeline.step2_lora_inpainting import LoRAInpaintTrainer
     trainer = LoRAInpaintTrainer(
         model_id=args.model_id,
         rank=cfg["lora_rank"],
         alpha=cfg["lora_alpha"],
+        lr_unet=cfg["lr_unet"],
+        lr_text_encoder=cfg["lr_text_encoder"],
+        lr_ti=cfg["lr_ti"],
         device=cfg["device"],
         output_dir=str(lora_out),
     )
 
-    # Dùng real defect dir làm data train (nếu có metadata sẵn thì dùng)
-    real_meta = Path(args.real_defect_dir) / "train_metadata.json"
-    if not real_meta.exists():
-        logger.error(f"Không tìm thấy {real_meta}. Tạo file JSON với cấu trúc:")
-        logger.error('  [{"image_path": "...", "mask_path": "...", "defect_type": "..."}]')
-        return
-
-    trainer.train(
-        data_json=str(real_meta),
+    ckpt_path = trainer.train(
+        data_json=metadata_path,
         epochs=cfg["lora_epochs"],
         batch_size=cfg["lora_batch"],
     )
-    # Trả về đường dẫn checkpoint mới nhất
-    return str(lora_out / f"epoch_{cfg['lora_epochs']:03d}")
+    return ckpt_path
 
 
 # ─────────────────────────────────────────────────────────
 # STEP 2b: Image Synthesis (Inpainting)
 # ─────────────────────────────────────────────────────────
 def run_step2_generate(mask_records: list[dict], args, cfg: dict) -> list[dict]:
+    from pcb_pipeline.step2_lora_inpainting import PCBDefectInpainter
+
     logger.info("=" * 60)
     logger.info("STEP 2b — Sinh ảnh lỗi PCB (SD Inpainting + LoRA)")
     logger.info(f"  steps={cfg['inpaint_steps']}  guidance={cfg['guidance_scale']}")
@@ -172,7 +206,15 @@ def run_step2_generate(mask_records: list[dict], args, cfg: dict) -> list[dict]:
 
     output_dir = Path(args.output_dir) / "generated"
     lora_ckpt = getattr(args, "lora_ckpt", None)
-    ti_ckpt = (Path(lora_ckpt) / "ti_embedding.pt") if lora_ckpt else None
+
+    # Tìm file ti_ckpt từ args hoặc trong thư mục lora_ckpt
+    ti_ckpt = getattr(args, "ti_ckpt", None)
+    if not ti_ckpt and lora_ckpt:
+        for name in ["ti_embeddings.pt", "ti_embedding.pt"]:
+            p = Path(lora_ckpt) / name
+            if p.exists():
+                ti_ckpt = str(p)
+                break
 
     inpainter = PCBDefectInpainter(
         model_id=args.model_id,
@@ -181,6 +223,7 @@ def run_step2_generate(mask_records: list[dict], args, cfg: dict) -> list[dict]:
         device=cfg["device"],
         num_inference_steps=cfg["inpaint_steps"],
         guidance_scale=cfg["guidance_scale"],
+        negative_prompt=cfg.get("negative_prompt", "blurry, low quality, deformed, ugly, watermark, signature, text, logo"),
     )
 
     t0 = time.time()
@@ -195,35 +238,45 @@ def run_step2_generate(mask_records: list[dict], args, cfg: dict) -> list[dict]:
 # STEP 3: Quality Filtering
 # ─────────────────────────────────────────────────────────
 def run_step3(generated_records: list[dict], args, cfg: dict) -> list[dict]:
+    from pcb_pipeline.step3_quality_filter import (
+        YOLO11DefectTrainer,
+        YOLO11ConfidenceScorer,
+        QualityFilter,
+    )
+
     logger.info("=" * 60)
     logger.info("STEP 3 — Lọc ảnh bằng YOLO11 (loại 25% thấp nhất)")
     logger.info("=" * 60)
 
-    output_dir = Path(args.output_dir) / "filtered"
+    out_base = Path(args.output_dir)
+    output_dir = out_base if out_base.name == "filtered" else out_base / "filtered"
     yolo_weights = getattr(args, "yolo_weights", None)
+    data_yaml = getattr(args, "data_yaml", None) or "data/id_setup.yaml"
 
     # Train YOLO judge nếu chưa có weights
-    if not yolo_weights and args.real_defect_dir:
+    if not yolo_weights and Path(data_yaml).exists():
         trainer = YOLO11DefectTrainer(
-            model_size=cfg["yolo_size"],
+            model_size=cfg.get("yolo_size", "s"),
             device=cfg["device"],
             project=str(Path(args.output_dir) / "yolo_training"),
         )
-        yaml_path = YOLO11DefectTrainer.build_dataset_yaml(
-            args.real_defect_dir,
-            Path(args.output_dir) / "pcb_yolo_dataset.yaml",
+        yolo_weights = trainer.train(
+            data_yaml,
+            epochs=cfg.get("yolo_epochs", 100),
         )
-        yolo_weights = trainer.train(yaml_path, epochs=cfg["yolo_epochs"])
 
-    if not yolo_weights:
-        logger.error("[Step 3] Không có YOLO weights! Bỏ qua bước lọc.")
-        return generated_records
+    scorer = YOLO11ConfidenceScorer(weights_path=yolo_weights, device=cfg["device"])
+    flt = QualityFilter(scorer, reject_ratio=cfg.get("reject_ratio", 0.25))
 
-    scorer = YOLO11ConfidenceScorer(yolo_weights, device=cfg["device"])
-    flt = QualityFilter(scorer, reject_ratio=cfg["reject_ratio"])
+    if getattr(args, "by_class", False):
+        accepted, rejected = flt.filter_by_class(generated_records, output_dir, data_yaml=data_yaml)
+    else:
+        accepted, rejected = flt.filter(generated_records, output_dir, data_yaml=data_yaml)
 
-    accepted, rejected = flt.filter(generated_records, output_dir)
     logger.info(f"✅ Step 3 xong: {len(accepted)} ảnh accepted / {len(rejected)} rejected")
+    aug_yaml = output_dir / "augmented_dataset.yaml"
+    if aug_yaml.exists():
+        logger.info(f"   Augmented Dataset YAML: {aug_yaml.resolve()}")
     return accepted
 
 
@@ -254,10 +307,13 @@ def run_full_pipeline(args, cfg: dict):
 
     # Tổng kết
     elapsed = time.time() - t_start
+    aug_yaml_path = out / "filtered" / "augmented_dataset.yaml"
     logger.info("=" * 60)
     logger.info("🎉 PIPELINE HOÀN TẤT")
     logger.info(f"   Tổng thời gian: {elapsed/60:.1f} phút")
     logger.info(f"   Ảnh sau lọc:   {len(final_records)}")
+    if aug_yaml_path.exists():
+        logger.info(f"   Augmented YAML: {aug_yaml_path.resolve()}")
     logger.info(f"   Output:        {out.resolve()}")
     logger.info("=" * 60)
 
@@ -267,6 +323,7 @@ def run_full_pipeline(args, cfg: dict):
         "total_generated":  len(gen_records),
         "total_accepted":   len(final_records),
         "rejected_ratio":   cfg["reject_ratio"],
+        "augmented_yaml":   str(aug_yaml_path.resolve()) if aug_yaml_path.exists() else None,
         "elapsed_minutes":  round(elapsed / 60, 1),
         "config":           cfg,
     }
@@ -300,47 +357,78 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(p_full)
     p_full.add_argument("--image_dir",       required=True,  help="Thư mục ảnh PCB không lỗi")
     p_full.add_argument("--real_defect_dir", default=None,   help="Thư mục ảnh lỗi thực (để train LoRA+YOLO)")
-    p_full.add_argument("--lora_ckpt",       default=None,   help="Đường dẫn LoRA checkpoint (nếu đã train)")
-    p_full.add_argument("--yolo_weights",    default=None,   help="best.pt của YOLO judge (nếu đã train)")
+    p_full.add_argument("--metadata_path",   default="data/train_metadata.json", help="Đường dẫn train_metadata.json")
+    p_full.add_argument("--camg_weights",    default=None,   help="Đường dẫn trọng số camg_best.pth")
+    p_full.add_argument("--k",               type=int, default=5, help="Top-k sampling cho CAMG")
     p_full.add_argument("--images_per_defect", type=int, default=1)
     p_full.add_argument("--mask_strategy",   default="saliency", choices=["saliency","random","grid"])
+    p_full.add_argument("--lora_ckpt",       default=None,   help="Đường dẫn LoRA checkpoint (nếu đã train)")
+    p_full.add_argument("--ti_ckpt",         default=None,   help="Đường dẫn ti_embeddings.pt (nếu đã train)")
     p_full.add_argument("--lora_rank",       type=int,   default=None)
     p_full.add_argument("--lora_alpha",      type=float, default=None)
     p_full.add_argument("--lora_epochs",     type=int,   default=None)
     p_full.add_argument("--lora_batch",      type=int,   default=None)
+    p_full.add_argument("--lr_unet",         type=float, default=None)
+    p_full.add_argument("--lr_text_encoder", type=float, default=None)
+    p_full.add_argument("--lr_ti",           type=float, default=None, help="Learning rate cho Textual Inversion")
     p_full.add_argument("--inpaint_steps",   type=int,   default=None)
+    p_full.add_argument("--guidance",        type=float, default=None)
+    p_full.add_argument("--negative_prompt", default=None)
+    p_full.add_argument("--yolo_weights",    default=None,   help="best.pt của YOLO judge (nếu đã train)")
+    p_full.add_argument("--data_yaml",       default="data/id_setup.yaml", help="File cấu hình dataset lỗi thực (ID 10%% hoặc NPI)")
+    p_full.add_argument("--yolo_size",       default=None, choices=["n", "s", "m", "l", "x"], help="Kích thước mô hình YOLO11 (mặc định 's' theo bài báo)")
+    p_full.add_argument("--yolo_epochs",     type=int, default=None, help="Số epochs huấn luyện YOLO judge (100 theo bài báo)")
     p_full.add_argument("--reject_ratio",    type=float, default=None)
+    p_full.add_argument("--by_class",        action="store_true", help="Lọc độc lập theo từng loại lỗi để cân bằng class")
+
+    # ── step1_train ──────────────────────────────────────
+    p1t = subparsers.add_parser("step1_train", help="Huấn luyện prediction heads của CAMG")
+    add_common(p1t)
+    p1t.add_argument("--metadata_path",      default="data/train_metadata.json", help="train_metadata.json từ Data Module")
+    p1t.add_argument("--epochs",             type=int,   default=10)
+    p1t.add_argument("--batch_size",         type=int,   default=32)
+    p1t.add_argument("--lr",                 type=float, default=1e-4)
 
     # ── step1 ────────────────────────────────────────────
-    p1 = subparsers.add_parser("step1", help="Chỉ chạy Step 1: Tạo mask")
+    p1 = subparsers.add_parser("step1", help="Chỉ chạy Step 1: Tạo mask bằng CAMG")
     add_common(p1)
     p1.add_argument("--image_dir",           required=True)
+    p1.add_argument("--camg_weights",        default=None, help="Đường dẫn trọng số camg_best.pth")
+    p1.add_argument("--k",                   type=int, default=5, help="Top-k sampling (mặc định k=5)")
     p1.add_argument("--images_per_defect",   type=int, default=1)
-    p1.add_argument("--mask_strategy",       default="saliency", choices=["saliency","random","grid"])
 
     # ── step2_train ──────────────────────────────────────
     p2t = subparsers.add_parser("step2_train", help="Chỉ chạy Step 2a: Fine-tune LoRA")
     add_common(p2t)
-    p2t.add_argument("--real_defect_dir",    required=True)
+    p2t.add_argument("--real_defect_dir",    default=None, help="Thư mục ảnh lỗi thực")
+    p2t.add_argument("--metadata_path",      default="data/train_metadata.json", help="train_metadata.json từ Data Module")
     p2t.add_argument("--lora_rank",          type=int,   default=None)
     p2t.add_argument("--lora_alpha",         type=float, default=None)
     p2t.add_argument("--lora_epochs",        type=int,   default=None)
     p2t.add_argument("--lora_batch",         type=int,   default=None)
+    p2t.add_argument("--lr_unet",            type=float, default=None)
+    p2t.add_argument("--lr_text_encoder",    type=float, default=None)
+    p2t.add_argument("--lr_ti",              type=float, default=None, help="Learning rate cho Textual Inversion")
 
     # ── step2_generate ───────────────────────────────────
     p2g = subparsers.add_parser("step2_generate", help="Chỉ chạy Step 2b: Sinh ảnh lỗi")
     add_common(p2g)
     p2g.add_argument("--mask_meta",          required=True, help="mask_metadata.json từ Step 1")
-    p2g.add_argument("--lora_ckpt",          default=None)
+    p2g.add_argument("--lora_ckpt",          default=None, help="Thư mục chứa LoRA checkpoint")
+    p2g.add_argument("--ti_ckpt",            default=None, help="File ti_embeddings.pt")
     p2g.add_argument("--inpaint_steps",      type=int,   default=None)
     p2g.add_argument("--guidance",           type=float, default=None)
+    p2g.add_argument("--negative_prompt",    default=None)
 
     # ── step3 ────────────────────────────────────────────
     p3 = subparsers.add_parser("step3", help="Chỉ chạy Step 3: Lọc ảnh YOLO11")
     add_common(p3)
     p3.add_argument("--gen_meta",            required=True, help="generated_metadata.json từ Step 2")
-    p3.add_argument("--yolo_weights",        default=None)
+    p3.add_argument("--yolo_weights",        default=None, help="File best.pt nếu đã train trước")
+    p3.add_argument("--data_yaml",           default="data/id_setup.yaml", help="Dataset YAML gốc (ID 10%%)")
     p3.add_argument("--real_defect_dir",     default=None)
+    p3.add_argument("--yolo_size",           default=None, choices=["n", "s", "m", "l", "x"], help="Kích thước mô hình YOLO11 (mặc định 's' theo bài báo)")
+    p3.add_argument("--yolo_epochs",         type=int, default=None, help="Số epochs huấn luyện YOLO judge (mặc định 100)")
     p3.add_argument("--reject_ratio",        type=float, default=None)
     p3.add_argument("--by_class",            action="store_true")
 
@@ -354,21 +442,30 @@ def main():
     cfg = load_config(
         getattr(args, "config", None),
         {
-            "device":          args.device,
-            "mask_strategy":   getattr(args, "mask_strategy", None),
+            "device":            args.device,
+            "mask_strategy":     getattr(args, "mask_strategy", None),
             "images_per_defect": getattr(args, "images_per_defect", None),
-            "lora_rank":       getattr(args, "lora_rank", None),
-            "lora_alpha":      getattr(args, "lora_alpha", None),
-            "lora_epochs":     getattr(args, "lora_epochs", None),
-            "lora_batch":      getattr(args, "lora_batch", None),
-            "inpaint_steps":   getattr(args, "inpaint_steps", None),
-            "guidance_scale":  getattr(args, "guidance", None),
-            "reject_ratio":    getattr(args, "reject_ratio", None),
+            "lora_rank":         getattr(args, "lora_rank", None),
+            "lora_alpha":        getattr(args, "lora_alpha", None),
+            "lora_epochs":       getattr(args, "lora_epochs", None),
+            "lora_batch":        getattr(args, "lora_batch", None),
+            "lr_unet":           getattr(args, "lr_unet", None),
+            "lr_text_encoder":   getattr(args, "lr_text_encoder", None),
+            "lr_ti":             getattr(args, "lr_ti", None),
+            "inpaint_steps":     getattr(args, "inpaint_steps", None),
+            "guidance_scale":    getattr(args, "guidance", None),
+            "negative_prompt":   getattr(args, "negative_prompt", None),
+            "reject_ratio":      getattr(args, "reject_ratio", None),
+            "yolo_size":         getattr(args, "yolo_size", None),
+            "yolo_epochs":       getattr(args, "yolo_epochs", None),
         },
     )
 
     if args.command == "full":
         run_full_pipeline(args, cfg)
+
+    elif args.command == "step1_train":
+        run_step1_train(args, cfg)
 
     elif args.command == "step1":
         run_step1(args, cfg)
@@ -384,23 +481,7 @@ def main():
     elif args.command == "step3":
         with open(args.gen_meta, encoding="utf-8") as f:
             gen_records = json.load(f)
-
-        yolo_weights = getattr(args, "yolo_weights", None)
-        if not yolo_weights and args.real_defect_dir:
-            trainer = YOLO11DefectTrainer(device=cfg["device"])
-            yaml_path = YOLO11DefectTrainer.build_dataset_yaml(
-                args.real_defect_dir,
-                Path(args.output_dir) / "pcb_yolo_dataset.yaml",
-            )
-            yolo_weights = trainer.train(yaml_path)
-
-        scorer = YOLO11ConfidenceScorer(yolo_weights, device=cfg["device"])
-        flt = QualityFilter(scorer, reject_ratio=cfg["reject_ratio"])
-
-        if getattr(args, "by_class", False):
-            flt.filter_by_class(gen_records, args.output_dir)
-        else:
-            flt.filter(gen_records, args.output_dir)
+        run_step3(gen_records, args, cfg)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,31 @@
+{
+  "total_raw_images": 10668,
+  "normal_images_count": 799,
+  "id_train_low_count": 668,
+  "id_val_count": 1180,
+  "npi_train_count": 668,
+  "npi_unseen_val_count": 2804,
+  "seen_boards": [
+    "01",
+    "04",
+    "05",
+    "06",
+    "07",
+    "08",
+    "09"
+  ],
+  "unseen_boards": [
+    "10",
+    "11",
+    "12"
+  ],
+  "bbox_q1_width": 21.96,
+  "bbox_q3_width": 36.0,
+  "bbox_q1_height": 21.000000000000004,
+  "bbox_q3_height": 36.0,
+  "exported_files": {
+    "id_yaml": "data\\id_setup.yaml",
+    "npi_yaml": "data\\npi_setup.yaml",
+    "train_metadata": "data\\train_metadata.json"
+  }
+}

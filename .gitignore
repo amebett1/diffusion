@@ -1,0 +1,54 @@
+# =============================================================================
+# Git Ignore Configuration for PCB Defect Synthesis Project
+# =============================================================================
+
+# ── 1. Dữ liệu ảnh lớn (Chia sẻ riêng qua Google Drive / Cloud Storage) ────────
+data/pcb-defect-dataset/
+data/pcb_normal/
+
+# ── 2. Các file nén & đóng gói ───────────────────────────────────────────────
+*.zip
+*.tar
+*.gz
+*.rar
+*.7z
+diffusion_colab.zip
+
+# ── 3. Trọng số mô hình & Checkpoints (Tránh đẩy file nhị phân lớn) ───────────
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.engine
+
+# ── 4. Thư mục đầu ra và file thử nghiệm tạm thời ───────────────────────────
+outputs/
+runs/
+scratch/
+wandb/
+
+# ── 5. Python Cache & Môi trường ảo ──────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# ── 6. Cấu hình IDE & Hệ điều hành ───────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── 7. File tài liệu PDF & Logs ──────────────────────────────────────────────
+*.pdf
+*.log
