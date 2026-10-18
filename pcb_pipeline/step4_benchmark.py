@@ -174,7 +174,7 @@ class DownstreamBenchmarker:
 
         logger.info("=" * 70)
         tag = "AUGMENTED (Real + Synthetic)" if is_augmented else "BASELINE (Real Low-Data)"
-        logger.info(f"🚀 HUẤN LUYỆN DOWNSTREAM: {model_name.upper()} | {tag}")
+        logger.info(f"HUẤN LUYỆN DOWNSTREAM: {model_name.upper()} | {tag}")
         logger.info(f"   Dataset:  {data_yaml}")
         logger.info(f"   Epochs:   {n_epochs} | Batch: {batch} | Imgsz: {self.imgsz} | Opt: {self.optimizer}")
         logger.info(f"   Run Name: {exp_name}")
@@ -218,7 +218,7 @@ class DownstreamBenchmarker:
         # Đánh giá trên tập validation theo Paper trang 8, cột 2:
         # "An IoU threshold of 0.25 and a confidence threshold of 0.25 were applied for precision and recall measure."
         logger.info(
-            f"📊 Đang đánh giá validation cho {exp_name} (conf={self.conf_thresh}, iou={self.iou_thresh})..."
+            f"Đang đánh giá validation cho {exp_name} (conf={self.conf_thresh}, iou={self.iou_thresh})..."
         )
         val_results = model.val(
             data=data_yaml,
@@ -242,7 +242,7 @@ class DownstreamBenchmarker:
             metrics["best_ckpt"] = str(best_ckpt.resolve()).replace("\\", "/")
 
         logger.info(
-            f"✅ Hoàn tất {exp_name}: mAP@50 = {metrics['map50']*100:.2f}% | "
+            f"Hoàn tất {exp_name}: mAP@50 = {metrics['map50']*100:.2f}% | "
             f"mAP@50-95 = {metrics['map50_95']*100:.2f}% | Thời gian: {train_time_min} phút"
         )
         return metrics
@@ -263,7 +263,7 @@ class DownstreamBenchmarker:
         n_epochs = epochs or self.epochs
         batch = batch_size or self.batch_size
         logger.info("#" * 70)
-        logger.info(f"🏁 BẮT ĐẦU DOWNSTREAM BENCHMARK [{split_name.upper()} SETUP]")
+        logger.info(f"BẮT ĐẦU DOWNSTREAM BENCHMARK [{split_name.upper()} SETUP]")
         logger.info(f"   Danh sách mô hình: {models}")
         logger.info(f"   Baseline YAML:   {base_yaml}")
         logger.info(f"   Augmented YAML:  {aug_yaml}")
@@ -358,10 +358,10 @@ class DownstreamBenchmarker:
             }
 
             logger.info(
-                f"\n🎉 [KẾT QUẢ {norm_name.upper()}]:\n"
-                f"   - Precision: {p_base:.2f}% ➡️ {p_aug:.2f}% (Δ: {delta_p:+.2f} pp)\n"
-                f"   - Recall:    {r_base:.2f}% ➡️ {r_aug:.2f}% (Δ: {delta_r:+.2f} pp)\n"
-                f"   - mAP@50:    {map50_base:.2f}% ➡️ {map50_aug:.2f}% (Δ: {delta_map50:+.2f} pp, Gain: {pct_gain:+.2f}%)"
+                f"\n[KẾT QUẢ {norm_name.upper()}]:\n"
+                f"   - Precision: {p_base:.2f}% -> {p_aug:.2f}% (Δ: {delta_p:+.2f} pp)\n"
+                f"   - Recall:    {r_base:.2f}% -> {r_aug:.2f}% (Δ: {delta_r:+.2f} pp)\n"
+                f"   - mAP@50:    {map50_base:.2f}% -> {map50_aug:.2f}% (Δ: {delta_map50:+.2f} pp, Gain: {pct_gain:+.2f}%)"
             )
 
         # ── XUẤT CÁC BÁO CÁO TỔNG HỢP ────────────────────────────
@@ -377,7 +377,7 @@ class DownstreamBenchmarker:
         json_path = self.output_dir / "benchmark_summary.json"
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
-        logger.info(f"[Reporter] 💾 Đã lưu JSON report: {json_path}")
+        logger.info(f"[Reporter] Đã lưu JSON report: {json_path}")
 
     def _save_csv_report(self, results: Dict):
         """Xuất bảng so sánh tổng hợp sang CSV bao gồm Precision, Recall, mAP50."""
@@ -443,7 +443,7 @@ class DownstreamBenchmarker:
                     ])
                 writer.writerow(row)
 
-        logger.info(f"[Reporter] 💾 Đã lưu CSV report: {csv_path}")
+        logger.info(f"[Reporter] Đã lưu CSV report: {csv_path}")
 
     def _save_markdown_report(self, results: Dict):
         """Tạo báo cáo Markdown chuẩn mực tái lập Table 3 & 6 của bài báo (Precision, Recall, mAP50)."""
@@ -515,13 +515,13 @@ class DownstreamBenchmarker:
         ])
 
         md_path.write_text("\n".join(md_content), encoding="utf-8")
-        logger.info(f"[Reporter] 💾 Đã lưu Markdown report: {md_path}")
+        logger.info(f"[Reporter] Đã lưu Markdown report: {md_path}")
 
     def _print_console_summary(self, results: Dict):
         """In bảng tóm tắt kết quả trực quan trên console terminal theo chuẩn Paper."""
         split_name = results.get("split_name", "id").upper()
         print("\n" + "=" * 105)
-        print(f"📊 KẾT QUẢ TỔNG KẾT DOWNSTREAM BENCHMARK [{split_name} SETUP - PAPER STANDARD]")
+        print(f"KẾT QUẢ TỔNG KẾT DOWNSTREAM BENCHMARK [{split_name} SETUP - PAPER STANDARD]")
         print("=" * 105)
         print(f"{'Model':<10} | {'Precision (Base -> Aug | Δ)':<28} | {'Recall (Base -> Aug | Δ)':<28} | {'mAP@50 (Base -> Aug | Δ | Gain)':<30}")
         print("-" * 105)
@@ -532,7 +532,7 @@ class DownstreamBenchmarker:
             map_str = f"{s['map50_baseline']:.1f}% -> {s['map50_augmented']:.1f}% ({s['delta_map50']:+.1f}pp | {s['percent_gain']:+.1f}%)"
             print(f"{model_name.upper():<10} | {p_str:<28} | {r_str:<28} | {map_str:<30}")
         print("=" * 105)
-        print(f"👉 Báo cáo chi tiết: {self.output_dir / 'benchmark_report.md'}")
+        print(f"Báo cáo chi tiết: {self.output_dir / 'benchmark_report.md'}")
         print("=" * 105 + "\n")
 
 

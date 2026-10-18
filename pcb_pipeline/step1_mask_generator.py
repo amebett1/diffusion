@@ -424,7 +424,7 @@ class CAMGTrainer:
                 torch.save(self.model.heads.state_dict(), best_ckpt_path)
                 logger.info(f"  -> Đã lưu best checkpoint tại {best_ckpt_path}")
 
-        logger.info(f"✅ Hoàn tất huấn luyện CAMG! Checkpoint: {best_ckpt_path}")
+        logger.info(f"Hoàn tất huấn luyện CAMG! Checkpoint: {best_ckpt_path}")
         return str(best_ckpt_path)
 
 
@@ -600,7 +600,7 @@ class CAMGGenerator:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2, ensure_ascii=False)
 
-        logger.info(f"✅ Đã tạo {len(records)} masks. Metadata lưu tại: {meta_path}")
+        logger.info(f"Đã tạo {len(records)} masks. Metadata lưu tại: {meta_path}")
         return records
 
 

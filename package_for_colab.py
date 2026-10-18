@@ -53,9 +53,9 @@ def create_colab_package(output_zip: str = "diffusion_colab.zip"):
     zip_path = root_dir / output_zip
 
     print("=" * 60)
-    print("📦 BẮT ĐẦU ĐÓNG GÓI DỰ ÁN CHO GOOGLE COLAB")
-    print(f"📂 Thư mục nguồn: {root_dir}")
-    print(f"🎯 File ZIP đích: {zip_path}")
+    print("BẮT ĐẦU ĐÓNG GÓI DỰ ÁN CHO GOOGLE COLAB")
+    print(f"Thư mục nguồn: {root_dir}")
+    print(f"File ZIP đích: {zip_path}")
     print("=" * 60)
 
     t0 = time.time()
@@ -93,14 +93,14 @@ def create_colab_package(output_zip: str = "diffusion_colab.zip"):
     orig_size_mb = total_uncompressed_bytes / (1024 * 1024)
 
     print("=" * 60)
-    print("✅ ĐÓNG GÓI THÀNH CÔNG!")
-    print(f"  📁 Tổng số files:        {file_count}")
-    print(f"  📊 Kích thước gốc:       {orig_size_mb:.1f} MB")
-    print(f"  🗜️ Kích thước file ZIP:  {zip_size_mb:.1f} MB")
-    print(f"  ⏱️ Thời gian nén:        {elapsed:.1f} giây")
-    print(f"  📍 Đường dẫn file:       {zip_path.resolve()}")
+    print("ĐÓNG GÓI THÀNH CÔNG!")
+    print(f"  Tổng số files:        {file_count}")
+    print(f"  Kích thước gốc:       {orig_size_mb:.1f} MB")
+    print(f"  Kích thước file ZIP:  {zip_size_mb:.1f} MB")
+    print(f"  Thời gian nén:        {elapsed:.1f} giây")
+    print(f"  Đường dẫn file:       {zip_path.resolve()}")
     print("=" * 60)
-    print("👉 Bây giờ bạn chỉ cần kéo thả file 'diffusion_colab.zip' này lên Google Drive!")
+    print("Bây giờ bạn chỉ cần kéo thả file 'diffusion_colab.zip' này lên Google Drive!")
 
 if __name__ == "__main__":
     create_colab_package()

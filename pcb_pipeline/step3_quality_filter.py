@@ -168,7 +168,7 @@ class YOLO11DefectTrainer:
                 exist_ok=True,
                 verbose=True,
             )
-            logger.info(f"[YOLO11 Judge] ✅ Huấn luyện hoàn tất! Trọng số lưu tại: {best_weights}")
+            logger.info(f"[YOLO11 Judge] Huấn luyện hoàn tất! Trọng số lưu tại: {best_weights}")
             return str(best_weights.resolve())
 
         # Fallback khi môi trường không có GPU
@@ -511,7 +511,7 @@ class QualityFilter:
         # ── TẠO FILE AUGMENTED DATASET YAML CHO DOWNSTREAM BENCHMARK ───────
         self._export_augmented_dataset(accepted_img_paths, out_dir, data_yaml)
 
-        logger.info(f"[Filter] 💾 Hoàn tất lọc! Kết quả và nhãn YOLO đã lưu tại: {out_dir}")
+        logger.info(f"[Filter] Hoàn tất lọc! Kết quả và nhãn YOLO đã lưu tại: {out_dir}")
         return accepted, rejected
 
     def filter_by_class(
@@ -593,13 +593,13 @@ class QualityFilter:
         aug_yaml_content = (
             f"# Augmented PCB Defect Dataset (Real 10% + Top 75% Accepted Synthetic)\n"
             f"path: .\n"
-            f"train: {str(aug_train_txt.resolve()).replace('\\', '/')}\n"
+            f"train: {aug_train_txt.resolve().as_posix()}\n"
             f"val: {val_img_source}\n\n"
             f"nc: 6\n"
             f"names: {PCB_DEFECT_CLASSES}\n"
         )
         aug_yaml_path.write_text(aug_yaml_content, encoding="utf-8")
-        logger.info(f"[Dataset Exporter] ✅ Đã tạo Augmented Dataset YAML: {aug_yaml_path}")
+        logger.info(f"[Dataset Exporter] Đã tạo Augmented Dataset YAML: {aug_yaml_path}")
         logger.info(f"  Tổng ảnh train: {len(merged_train_imgs)} (Thực: {len(real_train_imgs)} + Tổng hợp: {len(synthetic_img_paths)})")
 
 

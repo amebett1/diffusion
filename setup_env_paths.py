@@ -31,27 +31,27 @@ def adapt_paths(project_root: Path = None, mode: str = "relative"):
     raw_dataset_dir = data_dir / "pcb-defect-dataset"
 
     print("=" * 60)
-    print(f"🔧 Đang chuẩn hóa đường dẫn [Chế độ: {mode.upper()}] cho môi trường: {sys.platform}")
-    print(f"📂 Thư mục gốc dự án: {project_root}")
+    print(f"Đang chuẩn hóa đường dẫn [Chế độ: {mode.upper()}] cho môi trường: {sys.platform}")
+    print(f"Thư mục gốc dự án: {project_root}")
     print("=" * 60)
 
     # Kiểm tra xem dataset gốc đã được tải về hay chưa
     if not raw_dataset_dir.exists():
-        print(f"⚠️ Chưa tìm thấy thư mục: {raw_dataset_dir}")
-        print("👉 Vui lòng tải dataset và giải nén vào thư mục: data/pcb-defect-dataset/")
+        print(f"Chưa tìm thấy thư mục: {raw_dataset_dir}")
+        print("Vui lòng tải dataset và giải nén vào thư mục: data/pcb-defect-dataset/")
     else:
         # Tự động kiểm tra và sinh 799 ảnh normal sạch nếu chưa có
         normal_dir = data_dir / "pcb_normal"
         normals = list(normal_dir.glob("*.jpg")) + list(normal_dir.glob("*.png")) if normal_dir.exists() else []
         if len(normals) < 100:
-            print("🔄 Phát hiện chưa có thư mục data/pcb_normal (799 ảnh phôi sạch).")
+            print("Phát hiện chưa có thư mục data/pcb_normal (799 ảnh phôi sạch).")
             print("   Đang tự động khởi chạy data_module để sinh 799 ảnh normal theo chuẩn bài báo...")
             try:
                 from pcb_pipeline.data_module import PCBDataModule
                 dm = PCBDataModule(raw_dataset_dir=raw_dataset_dir, output_dir=data_dir)
                 dm.run_pipeline()
             except Exception as e:
-                print(f"⚠️ Lỗi khi tự động chạy data_module: {e}")
+                print(f"Lỗi khi tự động chạy data_module: {e}")
 
     # 1. Chuẩn hóa các file .txt trong data/prepared_splits/
     txt_files = list(splits_dir.glob("*.txt"))
@@ -80,7 +80,7 @@ def adapt_paths(project_root: Path = None, mode: str = "relative"):
         with open(txt_file, "w", encoding="utf-8") as f:
             for p in updated_lines:
                 f.write(f"{p}\n")
-        print(f"  ✅ Cập nhật {len(updated_lines)} đường dẫn trong: {txt_file.name}")
+        print(f"  Cập nhật {len(updated_lines)} đường dẫn trong: {txt_file.name}")
 
     # 2. Chuẩn hóa data/id_setup.yaml và data/npi_setup.yaml
     if mode == "absolute":
@@ -94,9 +94,10 @@ def adapt_paths(project_root: Path = None, mode: str = "relative"):
         npi_train_ref = "data/prepared_splits/npi_train_low.txt"
         npi_val_ref = "data/prepared_splits/npi_val_unseen.txt"
 
+    proj_root_str = str(project_root).replace("\\", "/")
     id_yaml_path = data_dir / "id_setup.yaml"
     if id_yaml_path.exists():
-        path_line = f"path: {str(project_root).replace('\\', '/')}\n" if mode == "absolute" else "path: .\n"
+        path_line = f"path: {proj_root_str}\n" if mode == "absolute" else "path: .\n"
         content_id = f"""# In-Distribution (ID) Dataset Config (10% Low-Data)
 {path_line}train: {id_train_ref}
 val: {id_val_ref}
@@ -105,11 +106,11 @@ nc: 6
 names: ['mouse_bite', 'spur', 'missing_hole', 'short', 'open_circuit', 'spurious_copper']
 """
         id_yaml_path.write_text(content_id, encoding="utf-8")
-        print(f"  ✅ Cập nhật: {id_yaml_path.name}")
+        print(f"  Cập nhật: {id_yaml_path.name}")
 
     npi_yaml_path = data_dir / "npi_setup.yaml"
     if npi_yaml_path.exists():
-        path_line = f"path: {str(project_root).replace('\\', '/')}\n" if mode == "absolute" else "path: .\n"
+        path_line = f"path: {proj_root_str}\n" if mode == "absolute" else "path: .\n"
         content_npi = f"""# New Product Introduction (NPI) Dataset Config
 # Train trên Seen Products, Val trên 100% Unseen Products
 {path_line}train: {npi_train_ref}
@@ -119,7 +120,7 @@ nc: 6
 names: ['mouse_bite', 'spur', 'missing_hole', 'short', 'open_circuit', 'spurious_copper']
 """
         npi_yaml_path.write_text(content_npi, encoding="utf-8")
-        print(f"  ✅ Cập nhật: {npi_yaml_path.name}")
+        print(f"  Cập nhật: {npi_yaml_path.name}")
 
     # 3. Chuẩn hóa data/train_metadata.json
     meta_path = data_dir / "train_metadata.json"
@@ -154,10 +155,10 @@ names: ['mouse_bite', 'spur', 'missing_hole', 'short', 'open_circuit', 'spurious
 
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
-        print(f"  ✅ Cập nhật {len(metadata)} bản ghi trong: {meta_path.name}")
+        print(f"  Cập nhật {len(metadata)} bản ghi trong: {meta_path.name}")
 
     print("=" * 60)
-    print("🎉 TẤT CẢ ĐƯỜNG DẪN ĐÃ ĐƯỢC ĐỒNG BỘ THÀNH CÔNG!")
+    print("TẤT CẢ ĐƯỜNG DẪN ĐÃ ĐƯỢC ĐỒNG BỘ THÀNH CÔNG!")
     print("=" * 60)
 
 if __name__ == "__main__":

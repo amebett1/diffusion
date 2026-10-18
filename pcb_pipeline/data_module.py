@@ -188,7 +188,7 @@ class PCBDataModule:
         stats_path = self.output_dir / "dataset_stats.json"
         with open(stats_path, "w", encoding="utf-8") as f:
             json.dump(stats, f, indent=2, ensure_ascii=False)
-        logger.info(f"✅ Đã lưu thống kê kích thước BBox vào {stats_path}")
+        logger.info(f"Đã lưu thống kê kích thước BBox vào {stats_path}")
         return stats
 
     def split_id_and_npi(
@@ -334,7 +334,7 @@ class PCBDataModule:
             if len(generated_paths) >= target_count:
                 break
 
-        logger.info(f"✅ Đã tạo thành công {len(generated_paths)} ảnh normal vào {output_dir}")
+        logger.info(f"Đã tạo thành công {len(generated_paths)} ảnh normal vào {output_dir}")
         return generated_paths
 
     def export_splits_to_disk(self, splits: Dict[str, Dict]) -> Dict[str, str]:
@@ -360,8 +360,8 @@ class PCBDataModule:
                 f.write(f"{r['image_path']}\n")
 
         id_yaml_content = f"""# In-Distribution (ID) Dataset Config (10% Low-Data)
-train: {str(id_train_txt.resolve()).replace('\\', '/')}
-val: {str(id_val_txt.resolve()).replace('\\', '/')}
+train: {id_train_txt.resolve().as_posix()}
+val: {id_val_txt.resolve().as_posix()}
 
 nc: {len(PCB_CLASSES)}
 names: {PCB_CLASSES}
@@ -385,8 +385,8 @@ names: {PCB_CLASSES}
 
         npi_yaml_content = f"""# New Product Introduction (NPI) Dataset Config
 # Train trên Seen Products, Val trên 100% Unseen Products
-train: {str(npi_train_txt.resolve()).replace('\\', '/')}
-val: {str(npi_val_unseen_txt.resolve()).replace('\\', '/')}
+train: {npi_train_txt.resolve().as_posix()}
+val: {npi_val_unseen_txt.resolve().as_posix()}
 
 nc: {len(PCB_CLASSES)}
 names: {PCB_CLASSES}
@@ -411,9 +411,9 @@ names: {PCB_CLASSES}
             json.dump(camg_train_meta, f, indent=2, ensure_ascii=False)
         yaml_paths["train_metadata"] = str(meta_path)
 
-        logger.info(f"✅ Đã xuất cấu hình ID YAML -> {id_yaml_path}")
-        logger.info(f"✅ Đã xuất cấu hình NPI YAML -> {npi_yaml_path}")
-        logger.info(f"✅ Đã xuất CAMG train metadata -> {meta_path}")
+        logger.info(f"Đã xuất cấu hình ID YAML -> {id_yaml_path}")
+        logger.info(f"Đã xuất cấu hình NPI YAML -> {npi_yaml_path}")
+        logger.info(f"Đã xuất CAMG train metadata -> {meta_path}")
 
         return yaml_paths
 
@@ -449,7 +449,7 @@ names: {PCB_CLASSES}
         with open(summary_file, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
 
-        logger.info(f"🎉 Hoàn tất tiền xử lý! Báo cáo chi tiết: {summary_file}")
+        logger.info(f"Hoàn tất tiền xử lý! Báo cáo chi tiết: {summary_file}")
         return summary
 
 

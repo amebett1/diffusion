@@ -137,7 +137,7 @@ class MultiTokenTIManager:
         self.text_encoder.get_input_embeddings().weight.requires_grad_(True)
         # Lưu bản sao ban đầu của từ điển để bảo toàn các token gốc không bị trôi
         self.orig_embeds_params = self.text_encoder.get_input_embeddings().weight.data.clone()
-        logger.info(f"[TI] ✅ Đã đăng ký và gắn kết Autograd cho các token: {list(self.placeholder_tokens.values())}")
+        logger.info(f"[TI] Đã đăng ký và gắn kết Autograd cho các token: {list(self.placeholder_tokens.values())}")
 
     def get_trainable_params(self) -> List[nn.Parameter]:
         """Trả về tham số embedding table cho Optimizer."""
@@ -545,8 +545,8 @@ class LoRAInpaintTrainer:
 
         self._init_models()
         if not getattr(self, "is_initialized", False):
-            logger.info("⚠️ Môi trường chưa cài thư viện 'diffusers' để huấn luyện GPU thực tế.")
-            logger.info(f"✅ Setup kiến trúc mã nguồn hoàn tất. Checkpoint dự kiến lưu tại: {ckpt_dir}")
+            logger.info("Môi trường chưa cài thư viện 'diffusers' để huấn luyện GPU thực tế.")
+            logger.info(f"Setup kiến trúc mã nguồn hoàn tất. Checkpoint dự kiến lưu tại: {ckpt_dir}")
             return str(ckpt_dir)
 
         # ── VÒNG LẶP HUẤN LUYỆN DIFFUSION THỰC TẾ ─────────────────────────
@@ -652,7 +652,7 @@ class LoRAInpaintTrainer:
         torch.save(lora_state, ckpt_dir / "pytorch_lora_weights.pt")
         self.ti_manager.save(ckpt_dir / "ti_embeddings.pt")
 
-        logger.info(f"✅ Hoàn tất huấn luyện LoRA! Đã lưu tại: {ckpt_dir}")
+        logger.info(f"Hoàn tất huấn luyện LoRA! Đã lưu tại: {ckpt_dir}")
         return str(ckpt_dir)
 
 
@@ -735,9 +735,9 @@ class PCBDefectInpainter:
                                 self.lora_text[k].load_state_dict(state)
                                 loaded_t += 1
                         logger.info(f"[Inpainter] Đã nạp LoRA Text Encoder: {loaded_t}/{len(self.lora_text)} modules.")
-                    logger.info("[Inpainter] ✅ Đã nạp thành công toàn bộ trọng số LoRA vào U-Net & Text Encoder!")
+                    logger.info("[Inpainter] Đã nạp thành công toàn bộ trọng số LoRA vào U-Net & Text Encoder!")
                 else:
-                    logger.warning(f"[Inpainter] ⚠️ Không tìm thấy checkpoint LoRA tại {lora_path}. Sẽ sử dụng base model.")
+                    logger.warning(f"[Inpainter] Không tìm thấy checkpoint LoRA tại {lora_path}. Sẽ sử dụng base model.")
 
             self.unet.eval()
             self.text_encoder.eval()
@@ -926,7 +926,7 @@ class PCBDefectInpainter:
         with open(meta_out, "w", encoding="utf-8") as f:
             json.dump(gen_records, f, indent=2, ensure_ascii=False)
 
-        logger.info(f"✅ Step 2 xong! Đã tạo {len(gen_records)} ảnh. Metadata: {meta_out}")
+        logger.info(f"Step 2 xong! Đã tạo {len(gen_records)} ảnh. Metadata: {meta_out}")
         return gen_records
 
 

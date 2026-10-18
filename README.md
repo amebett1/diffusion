@@ -6,7 +6,7 @@ Triển khai hoàn chỉnh theo bài báo khoa học:
 
 ---
 
-## 📌 Kiến trúc 4 bước cốt lõi của Pipeline
+## Kiến trúc 4 bước cốt lõi của Pipeline
 
 1. **Step 1 — Context-Aware Mask Generation (CAMG)**:
    - Backbone **DINOv2 ViT-B/14** (Frozen feature extractor).
@@ -36,7 +36,7 @@ Triển khai hoàn chỉnh theo bài báo khoa học:
 
 ---
 
-## 🛠️ Hướng dẫn cài đặt & Thiết lập dữ liệu
+## Hướng dẫn cài đặt & Thiết lập dữ liệu
 
 ### 1. Clone mã nguồn (Siêu nhẹ < 2 MB)
 ```bash
@@ -77,7 +77,7 @@ python run_pipeline.py prepare_data
 
 ---
 
-## 🚀 Cách chạy Pipeline
+## Cách chạy Pipeline
 
 ### Cách 1: Chạy trực tiếp trên Google Colab với GPU (Khuyên dùng)
 
@@ -85,7 +85,7 @@ Dự án đã tích hợp sẵn notebook [`run_on_colab.ipynb`](run_on_colab.ipy
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/amebett1/diffusion/blob/main/run_on_colab.ipynb)
 
-#### 📝 Hướng dẫn từng bước thao tác trên Google Colab:
+#### Hướng dẫn từng bước thao tác trên Google Colab:
 1. **Mở Notebook:**
    - Bấm vào nút **Open In Colab** ở trên, hoặc truy cập [Google Colab](https://colab.research.google.com/) $\rightarrow$ Chọn thẻ **GitHub** $\rightarrow$ Nhập `https://github.com/amebett1/diffusion` $\rightarrow$ Chọn file `run_on_colab.ipynb`.
 2. **Bật GPU T4:**
@@ -100,9 +100,9 @@ Dự án đã tích hợp sẵn notebook [`run_on_colab.ipynb`](run_on_colab.ipy
    - *(Nếu lưu file zip trên Drive cá nhân, bạn có thể mount Google Drive và giải nén như hướng dẫn trong ô code)*.
 4. **Bấm chạy toàn bộ (Run all):**
    - Trên thanh menu của Colab, chọn **Runtime** $\rightarrow$ Bấm **Run all** (hoặc bấm tổ hợp phím tắt **`Ctrl + F9`** trên Windows / **`Cmd + F9`** trên Mac).
-   - *(Hoặc bạn có thể bấm nút Play ▶️ ở bên trái từng ô code theo thứ tự từ trên xuống dưới)*.
+   - *(Hoặc bạn có thể bấm nút Play ở bên trái từng ô code theo thứ tự từ trên xuống dưới)*.
 
-#### ⚙️ Quá trình tự động diễn ra sau khi bấm Run all:
+#### Quá trình tự động diễn ra sau khi bấm Run all:
 - **Bước 1**: Tự động clone code từ GitHub và tải/giải nén dataset vào `data/pcb-defect-dataset/`.
 - **Bước 2**: Tự động cài đặt đầy đủ các thư viện (`diffusers`, `ultralytics`, `accelerate`,...).
 - **Bước 3**: Tự động phân chia ID/NPI splits và sinh 799 ảnh phôi sạch (`data/pcb_normal/`).
@@ -206,7 +206,7 @@ python run_pipeline.py step4 \
 
 ---
 
-## 📊 Cấu trúc Thư mục Kết quả Đầu ra (`outputs/`)
+## Cấu trúc Thư mục Kết quả Đầu ra (`outputs/`)
 
 ```text
 outputs/
@@ -232,7 +232,7 @@ outputs/
 
 ---
 
-## 📋 6 loại lỗi PCB chuẩn DeepPCB (Paper Standard)
+## 6 loại lỗi PCB chuẩn DeepPCB (Paper Standard)
 
 1. `mouse_bite` (Vết cắn góc viền)
 2. `spur` (Gờ lồi kim loại / via kim)

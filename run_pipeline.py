@@ -115,7 +115,7 @@ def run_step1_train(args, cfg: dict) -> str:
 
     trainer = CAMGTrainer(device=cfg["device"], lr=lr)
     ckpt = trainer.train(metadata_path=meta_path, epochs=epochs, batch_size=batch_size)
-    logger.info(f"✅ Huấn luyện CAMG hoàn tất -> {ckpt}")
+    logger.info(f"Huấn luyện CAMG hoàn tất -> {ckpt}")
     return ckpt
 
 
@@ -132,14 +132,14 @@ def run_step1(args, cfg: dict) -> list[dict]:
     if not img_dir.exists() or len(list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))) == 0:
         raw_dir = Path("data/pcb-defect-dataset")
         if raw_dir.exists():
-            logger.info(f"🔄 Không tìm thấy ảnh sạch trong '{img_dir}'. Tự động tạo 799 ảnh normal từ {raw_dir}...")
+            logger.info(f"Không tìm thấy ảnh sạch trong '{img_dir}'. Tự động tạo 799 ảnh normal từ {raw_dir}...")
             from pcb_pipeline.data_module import PCBDataModule
             dm = PCBDataModule(raw_dataset_dir=raw_dir, output_dir="data")
             dm.run_pipeline()
         else:
             raise FileNotFoundError(
-                f"❌ Không tìm thấy thư mục ảnh sạch '{img_dir}' và cũng không tìm thấy '{raw_dir}'.\n"
-                f"👉 Hãy tải dataset và giải nén vào 'data/pcb-defect-dataset/', sau đó chạy 'python run_pipeline.py prepare_data'!"
+                f"Không tìm thấy thư mục ảnh sạch '{img_dir}' và cũng không tìm thấy '{raw_dir}'.\n"
+                f"Hãy tải dataset và giải nén vào 'data/pcb-defect-dataset/', sau đó chạy 'python run_pipeline.py prepare_data'!"
             )
 
     gen = CAMGGenerator(
@@ -153,7 +153,7 @@ def run_step1(args, cfg: dict) -> list[dict]:
         defect_types=args.defect_types or PCB_DEFECT_TYPES,
         images_per_defect=getattr(args, "images_per_defect", 1),
     )
-    logger.info(f"✅ Step 1 xong: {len(records)} mask records")
+    logger.info(f"Step 1 xong: {len(records)} mask records")
     return records
 
 
@@ -244,7 +244,7 @@ def run_step2_generate(mask_records: list[dict], args, cfg: dict) -> list[dict]:
     results = inpainter.generate_batch(mask_records, output_dir)
     elapsed = time.time() - t0
     per_img = elapsed / max(len(results), 1)
-    logger.info(f"✅ Step 2b xong: {len(results)} ảnh | {per_img:.1f}s/ảnh")
+    logger.info(f"Step 2b xong: {len(results)} ảnh | {per_img:.1f}s/ảnh")
     return results
 
 
@@ -287,7 +287,7 @@ def run_step3(generated_records: list[dict], args, cfg: dict) -> list[dict]:
     else:
         accepted, rejected = flt.filter(generated_records, output_dir, data_yaml=data_yaml)
 
-    logger.info(f"✅ Step 3 xong: {len(accepted)} ảnh accepted / {len(rejected)} rejected")
+    logger.info(f"Step 3 xong: {len(accepted)} ảnh accepted / {len(rejected)} rejected")
     aug_yaml = output_dir / "augmented_dataset.yaml"
     if aug_yaml.exists():
         logger.info(f"   Augmented Dataset YAML: {aug_yaml.resolve()}")
@@ -302,7 +302,7 @@ def run_full_pipeline(args, cfg: dict):
     out.mkdir(parents=True, exist_ok=True)
     save_config(cfg, out)
 
-    logger.info("🚀 Bắt đầu PCB Defect Synthesis Pipeline")
+    logger.info("Bắt đầu PCB Defect Synthesis Pipeline")
     logger.info(f"   Output: {out.resolve()}")
     t_start = time.time()
 
@@ -311,14 +311,14 @@ def run_full_pipeline(args, cfg: dict):
     if not img_dir.exists() or len(list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))) == 0:
         raw_dir = Path("data/pcb-defect-dataset")
         if raw_dir.exists():
-            logger.info(f"🔄 Chưa tìm thấy ảnh sạch trong '{img_dir}'. Đang tự động tạo 799 ảnh normal theo chuẩn bài báo...")
+            logger.info(f"Chưa tìm thấy ảnh sạch trong '{img_dir}'. Đang tự động tạo 799 ảnh normal theo chuẩn bài báo...")
             from pcb_pipeline.data_module import PCBDataModule
             dm = PCBDataModule(raw_dataset_dir=raw_dir, output_dir="data")
             dm.run_pipeline()
         else:
             raise FileNotFoundError(
-                f"❌ Không tìm thấy thư mục '{img_dir}' và cũng không tìm thấy '{raw_dir}'.\n"
-                f"👉 Hãy tải dataset và giải nén vào 'data/pcb-defect-dataset/', sau đó chạy 'python run_pipeline.py prepare_data'!"
+                f"Không tìm thấy thư mục '{img_dir}' và cũng không tìm thấy '{raw_dir}'.\n"
+                f"Hãy tải dataset và giải nén vào 'data/pcb-defect-dataset/', sau đó chạy 'python run_pipeline.py prepare_data'!"
             )
 
     # Step 1: Mask Generation
@@ -346,7 +346,7 @@ def run_full_pipeline(args, cfg: dict):
     # Tổng kết
     elapsed = time.time() - t_start
     logger.info("=" * 60)
-    logger.info("🎉 PIPELINE HOÀN TẤT")
+    logger.info("PIPELINE HOÀN TẤT")
     logger.info(f"   Tổng thời gian: {elapsed/60:.1f} phút")
     logger.info(f"   Ảnh sau lọc:   {len(final_records)}")
     if aug_yaml_path.exists():
@@ -432,8 +432,8 @@ def run_prepare_data(args, cfg: dict):
     out_dir = Path(args.output_dir)
     if not raw_dir.exists():
         raise FileNotFoundError(
-            f"❌ Không tìm thấy thư mục dataset gốc: '{raw_dir}'.\n"
-            f"👉 Vui lòng tải dataset và giải nén vào đúng thư mục '{raw_dir}' rồi thử lại!"
+            f"Không tìm thấy thư mục dataset gốc: '{raw_dir}'.\n"
+            f"Vui lòng tải dataset và giải nén vào đúng thư mục '{raw_dir}' rồi thử lại!"
         )
     logger.info("=" * 60)
     logger.info("PREPARE DATA — Phân chia ID/NPI splits & Tạo 799 ảnh phôi sạch pcb_normal")
@@ -441,7 +441,7 @@ def run_prepare_data(args, cfg: dict):
     dm = PCBDataModule(raw_dataset_dir=raw_dir, output_dir=out_dir)
     dm.run_pipeline()
     adapt_paths(mode="relative")
-    logger.info("✅ Dữ liệu đã sẵn sàng để chạy pipeline!")
+    logger.info("Dữ liệu đã sẵn sàng để chạy pipeline!")
 
 
 # ─────────────────────────────────────────────────────────
