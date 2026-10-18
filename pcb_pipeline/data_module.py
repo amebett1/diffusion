@@ -81,10 +81,25 @@ class PCBDataModule:
         Quét toàn bộ ảnh và nhãn trong raw dataset, đọc thông tin bounding box.
         Trả về danh sách các sample record.
         """
+        if not self.raw_dir.exists():
+            raise FileNotFoundError(
+                f"Không tìm thấy thư mục dataset: '{self.raw_dir.resolve()}'. "
+                f"Vui lòng tạo thư mục và đưa dữ liệu PCB vào 'data/pcb-defect-dataset/'!"
+            )
+
+        # Hỗ trợ tự động dò nếu bị lồng 1 cấp thư mục khi giải nén zip
+        actual_raw_dir = self.raw_dir
+        if not any((actual_raw_dir / s / "images").exists() for s in ["train", "val", "test"]):
+            for sub in actual_raw_dir.iterdir():
+                if sub.is_dir() and any((sub / s / "images").exists() for s in ["train", "val", "test"]):
+                    actual_raw_dir = sub
+                    logger.info(f"Phát hiện dữ liệu nằm trong thư mục con: {actual_raw_dir}")
+                    break
+
         records = []
         for split in ["train", "val", "test"]:
-            img_dir = self.raw_dir / split / "images"
-            lbl_dir = self.raw_dir / split / "labels"
+            img_dir = actual_raw_dir / split / "images"
+            lbl_dir = actual_raw_dir / split / "labels"
             if not img_dir.exists():
                 continue
 
@@ -131,6 +146,12 @@ class PCBDataModule:
                     "boxes": boxes,
                     "num_boxes": len(boxes),
                 })
+
+        if not records:
+            raise FileNotFoundError(
+                f"Không tìm thấy ảnh nào trong thư mục '{actual_raw_dir.resolve()}'. "
+                "Vui lòng đảm bảo dataset đã được giải nén đúng cấu trúc (train/images, val/images, test/images)!"
+            )
 
         logger.info(f"Đã quét tổng cộng {len(records)} ảnh trong raw dataset.")
         return records
