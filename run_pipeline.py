@@ -128,6 +128,17 @@ def run_step1(args, cfg: dict) -> list[dict]:
     weights_path = getattr(args, "camg_weights", None)
     k = getattr(args, "k", 5)
 
+    meta_json = output_dir / "mask_metadata.json"
+    if meta_json.exists():
+        try:
+            with open(meta_json, "r", encoding="utf-8") as f:
+                cached_records = json.load(f)
+            if cached_records and len(cached_records) > 0:
+                logger.info(f"[CAMG] Tái sử dụng {len(cached_records)} masks đã sinh trước đó từ: {meta_json}")
+                return cached_records
+        except Exception as e:
+            logger.warning(f"[CAMG] Không thể đọc mask metadata cũ: {e}. Đang sinh lại...")
+
     img_dir = Path(args.image_dir)
     if not img_dir.exists() or len(list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))) == 0:
         raw_dir = Path("data/pcb-defect-dataset")

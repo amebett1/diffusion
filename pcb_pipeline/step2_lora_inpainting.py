@@ -228,6 +228,9 @@ class LoRALinearLayer(nn.Module):
         self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.lora_A.device != x.device:
+            self.lora_A.data = self.lora_A.data.to(x.device)
+            self.lora_B.data = self.lora_B.data.to(x.device)
         return self.scale * F.linear(F.linear(x, self.lora_A), self.lora_B)
 
 
@@ -249,7 +252,11 @@ def inject_lora_into_model(
         if isinstance(module, nn.Linear):
             if any(name.endswith(tgt) or tgt in name for tgt in target_modules):
                 in_feat, out_feat = module.in_features, module.out_features
-                lora_layer = LoRALinearLayer(in_feat, out_feat, rank=rank, alpha=alpha)
+                target_device = module.weight.device
+                target_dtype = module.weight.dtype
+                lora_layer = LoRALinearLayer(in_feat, out_feat, rank=rank, alpha=alpha).to(
+                    device=target_device, dtype=target_dtype
+                )
                 lora_layers[name] = lora_layer
                 setattr(module, "lora_layer", lora_layer)
 
@@ -257,7 +264,10 @@ def inject_lora_into_model(
 
                 def make_new_forward(m, orig_f):
                     def forward_fn(x):
-                        return orig_f(x) + m.lora_layer(x.to(m.lora_layer.lora_A.dtype))
+                        dev = m.lora_layer.lora_A.device
+                        dtype = m.lora_layer.lora_A.dtype
+                        x_lora = x.to(device=dev, dtype=dtype) if (x.device != dev or x.dtype != dtype) else x
+                        return orig_f(x) + m.lora_layer(x_lora)
                     return forward_fn
 
                 module.forward = make_new_forward(module, orig_forward)
