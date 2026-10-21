@@ -440,6 +440,7 @@ class PCBLoRADataset(Dataset):
             "mask": mask_tensor,
             "defect_type": defect_type,
             "image_path": img_path,
+            "index": idx,
         }
 
 
@@ -468,6 +469,7 @@ class LoRAInpaintTrainer:
         lr_ti: float = 5e-4,
         device: str = "cuda",
         output_dir: str = "outputs/lora_checkpoints",
+        use_fp16: bool = True,
     ):
         self.model_id = model_id
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -480,6 +482,9 @@ class LoRAInpaintTrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.loss_fn = DualInpaintLoss(lambda_rec=0.1)
+        # Mục 1: Bật Mixed Precision (FP16 / AMP)
+        self.use_amp = use_fp16 and (self.device.type == "cuda")
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
     def _init_models(self):
         """Khởi tạo và đóng băng các thành phần của Diffusion Model."""
@@ -533,7 +538,7 @@ class LoRAInpaintTrainer:
         batch_size: int = 32,
     ) -> str:
         """
-        Vòng lặp huấn luyện chính thức chuẩn bài báo.
+        Vòng lặp huấn luyện chính thức chuẩn bài báo (tích hợp FP16 và VAE pre-encoding cache).
         """
         logger.info("=" * 60)
         logger.info("[LoRA Inpaint Trainer] Khởi chạy huấn luyện Dual-Loss LoRA:")
@@ -541,7 +546,7 @@ class LoRAInpaintTrainer:
         logger.info(f"  LoRA Config:  rank={self.rank}, alpha={self.alpha}")
         logger.info(f"  Epochs:       {epochs}, Batch size: {batch_size}")
         logger.info(f"  LR U-Net:     {self.lr_unet}, LR Text: {self.lr_text_encoder}, LR TI: {self.lr_ti}")
-        logger.info(f"  Device:       {self.device}")
+        logger.info(f"  Device:       {self.device} (Mixed Precision AMP: {self.use_amp})")
         logger.info("=" * 60)
 
         data_path = Path(data_json)
@@ -560,6 +565,34 @@ class LoRAInpaintTrainer:
             logger.info(f"Setup kiến trúc mã nguồn hoàn tất. Checkpoint dự kiến lưu tại: {ckpt_dir}")
             return str(ckpt_dir)
 
+        # ── MỤC 2: TIỀN MÃ HÓA BỘ NHỚ ĐỆM VAE LATENTS (PRE-ENCODE CACHE) ────
+        # 668 ảnh chỉ tốn ~22MB RAM, tránh việc VAE phải encode lặp lại mỗi epoch
+        logger.info("[LoRA Trainer] Đang tiền mã hóa VAE Latents (Pre-encode cache 668 ảnh)...")
+        cached_latents = {}
+        cached_mask_lat_def = {}
+        cached_masked_lat_def = {}
+
+        with torch.no_grad():
+            for idx in tqdm(range(len(dataset)), desc="Pre-encoding VAE Latents", leave=False):
+                sample = dataset[idx]
+                img_t = sample["image"].unsqueeze(0).to(self.device)
+                msk_t = sample["mask"].unsqueeze(0).to(self.device)
+
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    lat = self.vae.encode(img_t).latent_dist.sample() * 0.18215
+                    lh, lw = lat.shape[-2:]
+                    m_lat = F.interpolate(msk_t, size=(lh, lw), mode="nearest")
+                    m_img = img_t * (1.0 - msk_t)
+                    m_lat_img = self.vae.encode(m_img).latent_dist.sample() * 0.18215
+
+                cached_latents[idx] = lat.cpu()
+                cached_mask_lat_def[idx] = m_lat.cpu()
+                cached_masked_lat_def[idx] = m_lat_img.cpu()
+
+        logger.info(f"[LoRA Trainer] Đã cache thành công {len(cached_latents)} VAE latents vào RAM (Mục 2)!")
+        if self.use_amp:
+            logger.info("[LoRA Trainer] Đã kích hoạt Mixed Precision (FP16 / AMP) cho U-Net & Text Encoder (Mục 1)!")
+
         # ── VÒNG LẶP HUẤN LUYỆN DIFFUSION THỰC TẾ ─────────────────────────
         self.unet.train()
         self.text_encoder.train()
@@ -571,13 +604,18 @@ class LoRAInpaintTrainer:
 
             pbar_loader = tqdm(dataloader, desc=f"Epoch [{epoch}/{epochs}] [LoRA Dual-Loss]", leave=False, unit="mẫu")
             for step, batch in enumerate(pbar_loader):
+                sample_idx = batch["index"][0].item() if "index" in batch else None
                 images = batch["image"].to(self.device)   # (1, 3, 512, 512)
                 masks = batch["mask"].to(self.device)     # (1, 1, 512, 512)
                 defect_type = batch["defect_type"][0]
 
-                # 1. Mã hóa ảnh qua VAE để lấy latent z0
-                with torch.no_grad():
-                    latents = self.vae.encode(images).latent_dist.sample() * 0.18215
+                # 1. Mã hóa ảnh qua VAE để lấy latent z0 (Lấy từ RAM cache Mục 2)
+                if sample_idx is not None and sample_idx in cached_latents:
+                    latents = cached_latents[sample_idx].to(self.device)
+                else:
+                    with torch.no_grad():
+                        with torch.cuda.amp.autocast(enabled=self.use_amp):
+                            latents = self.vae.encode(images).latent_dist.sample() * 0.18215
                 latent_h, latent_w = latents.shape[-2:]
 
                 # 2. Lấy mẫu bước thời gian t và cộng nhiễu Gaussian
@@ -595,8 +633,9 @@ class LoRAInpaintTrainer:
                 tokens_def = self.tokenizer(prompt_def, padding="max_length", max_length=77, return_tensors="pt").input_ids.to(self.device)
                 tokens_rec = self.tokenizer(prompt_rec, padding="max_length", max_length=77, return_tensors="pt").input_ids.to(self.device)
 
-                text_emb_def = self.text_encoder(tokens_def)[0]
-                text_emb_rec = self.text_encoder(tokens_rec)[0]
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    text_emb_def = self.text_encoder(tokens_def)[0]
+                    text_emb_rec = self.text_encoder(tokens_rec)[0]
 
                 # 4. Lấy mẫu bounding box B' từ vùng không lỗi (Equation 7)
                 rec_masks = self.loss_fn.sample_negative_mask(masks)
@@ -607,48 +646,68 @@ class LoRAInpaintTrainer:
                 in_channels = getattr(self.unet.config, "in_channels", 9)
                 if in_channels == 9:
                     with torch.no_grad():
-                        # Nhánh Defect (mask B):
-                        mask_lat_def = F.interpolate(masks, size=(latent_h, latent_w), mode="nearest")
-                        masked_img_def = images * (1.0 - masks)
-                        masked_lat_def = self.vae.encode(masked_img_def).latent_dist.sample() * 0.18215
+                        # Nhánh Defect (mask B) - Lấy từ RAM cache Mục 2:
+                        if sample_idx is not None and sample_idx in cached_mask_lat_def:
+                            mask_lat_def = cached_mask_lat_def[sample_idx].to(self.device)
+                            masked_lat_def = cached_masked_lat_def[sample_idx].to(self.device)
+                        else:
+                            mask_lat_def = F.interpolate(masks, size=(latent_h, latent_w), mode="nearest")
+                            masked_img_def = images * (1.0 - masks)
+                            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                                masked_lat_def = self.vae.encode(masked_img_def).latent_dist.sample() * 0.18215
                         unet_input_def = torch.cat([noisy_latents, mask_lat_def, masked_lat_def], dim=1)
 
-                        # Nhánh Reconstruction (mask B'):
+                        # Nhánh Reconstruction (mask B' ngẫu nhiên mỗi step):
                         mask_lat_rec = F.interpolate(rec_masks, size=(latent_h, latent_w), mode="nearest")
                         masked_img_rec = images * (1.0 - rec_masks)
-                        masked_lat_rec = self.vae.encode(masked_img_rec).latent_dist.sample() * 0.18215
+                        with torch.cuda.amp.autocast(enabled=self.use_amp):
+                            masked_lat_rec = self.vae.encode(masked_img_rec).latent_dist.sample() * 0.18215
                         unet_input_rec = torch.cat([noisy_latents, mask_lat_rec, masked_lat_rec], dim=1)
                 else:
                     unet_input_def = noisy_latents
                     unet_input_rec = noisy_latents
 
-                # 5. U-Net dự đoán nhiễu cho cả 2 nhánh (Defect và Reconstruction)
-                noise_pred_def = self.unet(unet_input_def, timesteps, encoder_hidden_states=text_emb_def).sample
-                noise_pred_rec = self.unet(unet_input_rec, timesteps, encoder_hidden_states=text_emb_rec).sample
+                # 5. U-Net dự đoán nhiễu cho cả 2 nhánh (AMP FP16 Mục 1)
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    noise_pred_def = self.unet(unet_input_def, timesteps, encoder_hidden_states=text_emb_def).sample
+                    noise_pred_rec = self.unet(unet_input_rec, timesteps, encoder_hidden_states=text_emb_rec).sample
 
-                # 6. Tính toán Dual Loss (L_tot = L_def + 0.1 * L_rec)
-                loss, l_def, l_rec = self.loss_fn(
-                    noise_pred_def=noise_pred_def,
-                    noise_target=noise,
-                    defect_mask=masks,
-                    noise_pred_rec=noise_pred_rec,
-                    rec_mask=rec_masks,
-                )
+                    # 6. Tính toán Dual Loss (L_tot = L_def + 0.1 * L_rec)
+                    loss, l_def, l_rec = self.loss_fn(
+                        noise_pred_def=noise_pred_def,
+                        noise_target=noise,
+                        defect_mask=masks,
+                        noise_pred_rec=noise_pred_rec,
+                        rec_mask=rec_masks,
+                    )
 
-                # 7. Chia tỷ lệ loss cho batch_size và tích lũy gradient
-                scaled_loss = loss / batch_size
-                scaled_loss.backward()
+                    # 7. Chia tỷ lệ loss cho batch_size và tích lũy gradient
+                    scaled_loss = loss / batch_size
+
+                if self.use_amp:
+                    self.scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
+
                 accum_steps += 1
                 epoch_loss += loss.item()
                 pbar_loader.set_postfix({"loss": f"{loss.item():.4f}", "l_def": f"{l_def.item():.4f}", "l_rec": f"{l_rec.item():.4f}"})
 
                 if accum_steps % batch_size == 0 or step == len(dataloader) - 1:
+                    if self.use_amp:
+                        self.scaler.unscale_(self.optimizer)
+
                     # Triệt tiêu gradient token thường của CLIP, bảo toàn 6 token TI
                     self.ti_manager.zero_non_placeholder_grads()
 
                     torch.nn.utils.clip_grad_norm_(self.unet.parameters(), max_norm=1.0)
                     torch.nn.utils.clip_grad_norm_(self.text_encoder.parameters(), max_norm=1.0)
-                    self.optimizer.step()
+
+                    if self.use_amp:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
 
                     # Khôi phục token vocab gốc nếu bị ảnh hưởng và reset gradient
                     self.ti_manager.restore_non_placeholder_embeddings()
@@ -708,10 +767,11 @@ class PCBDefectInpainter:
         """Khởi tạo pipeline và nạp các checkpoint LoRA + Textual Inversion nếu có."""
         try:
             from diffusers import StableDiffusionInpaintPipeline, DDIMScheduler
-            logger.info(f"[Inpainter] Đang tải Inpainting Pipeline: {self.model_id}...")
+            dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+            logger.info(f"[Inpainter] Đang tải Inpainting Pipeline ({dtype}): {self.model_id}...")
             pipe = StableDiffusionInpaintPipeline.from_pretrained(
                 self.model_id,
-                torch_dtype=torch.float32,
+                torch_dtype=dtype,
             ).to(self.device)
 
             pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
@@ -806,8 +866,8 @@ class PCBDefectInpainter:
             img_np = np.array(img_resized).astype(np.float32) / 127.5 - 1.0
             msk_np = (np.array(msk_resized) > 128).astype(np.float32)
 
-            img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(self.device)  # (1, 3, H, W)
-            msk_tensor = torch.from_numpy(msk_np).unsqueeze(0).unsqueeze(0).to(self.device)      # (1, 1, H, W)
+            img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device=self.device, dtype=self.unet.dtype)  # (1, 3, H, W)
+            msk_tensor = torch.from_numpy(msk_np).unsqueeze(0).unsqueeze(0).to(device=self.device, dtype=self.unet.dtype)      # (1, 1, H, W)
 
             # 2. Mã hóa ảnh gốc sang Latent z0_orig
             z0_orig = self.vae.encode(img_tensor).latent_dist.sample() * 0.18215
