@@ -72,6 +72,7 @@ DEFAULT_CONFIG = {
     "lr_text_encoder":   5e-5,
     "lr_ti":             5e-4,
     # Step 2 — Inference
+    "num_samples":       829,              # Chuẩn bài báo: 829 ảnh lỗi tổng hợp cho PCB (Trang 6 Col 2)
     "inpaint_steps":     50,               # ~4 giây/ảnh
     "guidance_scale":    7.5,
     "negative_prompt":   "blurry, low quality, deformed, ugly, watermark, signature, text, logo",
@@ -384,10 +385,37 @@ def run_step2_train(args, cfg: dict):
 # STEP 2b: Image Synthesis (Inpainting)
 # ─────────────────────────────────────────────────────────
 def run_step2_generate(mask_records: list[dict], args, cfg: dict) -> list[dict]:
+    import random
     from pcb_pipeline.step2_lora_inpainting import PCBDefectInpainter
 
+    num_samples = getattr(args, "num_samples", None)
+    if num_samples is None:
+        num_samples = cfg.get("num_samples", 829)
+
+    # Lấy mẫu cân bằng theo từng loại lỗi chuẩn theo bài báo (Trang 6 Cột 2: 829 ảnh)
+    if num_samples and len(mask_records) > num_samples:
+        logger.info(f"[Step 2b] Lấy mẫu cân bằng {num_samples} ảnh từ {len(mask_records)} masks (chuẩn thực nghiệm bài báo)...")
+        by_defect = {}
+        for r in mask_records:
+            by_defect.setdefault(r["defect_type"], []).append(r)
+
+        selected = []
+        n_types = len(by_defect)
+        base_per_type = num_samples // n_types
+        remainder = num_samples % n_types
+
+        rng = random.Random(42)  # Cố định seed 42 để đảm bảo tính tái lập (reproducibility)
+        for idx, (dtype, records) in enumerate(sorted(by_defect.items())):
+            quota = base_per_type + (1 if idx < remainder else 0)
+            shuffled = list(records)
+            rng.shuffle(shuffled)
+            selected.extend(shuffled[:quota])
+
+        logger.info(f"   -> Đã chọn chính xác {len(selected)} masks (cân bằng ~{base_per_type} ảnh/class cho 6 loại lỗi).")
+        mask_records = selected
+
     logger.info("=" * 60)
-    logger.info("STEP 2b — Sinh ảnh lỗi PCB (SD Inpainting + LoRA)")
+    logger.info(f"STEP 2b — Sinh {len(mask_records)} ảnh lỗi PCB (SD Inpainting + LoRA)")
     logger.info(f"  steps={cfg['inpaint_steps']}  guidance={cfg['guidance_scale']}")
     logger.info("=" * 60)
 
@@ -827,6 +855,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_full.add_argument("--inpaint_steps",   type=int,   default=None)
     p_full.add_argument("--guidance",        type=float, default=None)
     p_full.add_argument("--negative_prompt", default=None)
+    p_full.add_argument("--num_samples",     type=int, default=829, help="Số lượng ảnh lỗi tổng hợp cần sinh (chuẩn bài báo: 829 ảnh)")
     p_full.add_argument("--yolo_weights",    default=None,   help="best.pt của YOLO judge (nếu đã train)")
     p_full.add_argument("--data_yaml",       default="data/id_setup.yaml", help="File cấu hình dataset lỗi thực (ID 10%% hoặc NPI)")
     p_full.add_argument("--yolo_size",       default=None, choices=["n", "s", "m", "l", "x"], help="Kích thước mô hình YOLO11 (mặc định 's' theo bài báo)")
@@ -882,6 +911,7 @@ def build_parser() -> argparse.ArgumentParser:
     p2g.add_argument("--inpaint_steps",      type=int,   default=None)
     p2g.add_argument("--guidance",           type=float, default=None)
     p2g.add_argument("--negative_prompt",    default=None)
+    p2g.add_argument("--num_samples",        type=int, default=829, help="Số lượng ảnh lỗi tổng hợp cần sinh (chuẩn bài báo: 829 ảnh)")
 
     # ── step3 ────────────────────────────────────────────
     p3 = subparsers.add_parser("step3", help="Chỉ chạy Step 3: Lọc ảnh YOLO11")

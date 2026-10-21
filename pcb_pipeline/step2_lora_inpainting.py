@@ -973,16 +973,18 @@ class PCBDefectInpainter:
             mask_path = rec["mask_path"]
             defect_type = rec["defect_type"]
 
-            gen_img = self.generate(
-                normal_image=normal_img_path,
-                defect_mask=mask_path,
-                defect_type=defect_type,
-            )
-
             stem = Path(normal_img_path).stem
             out_name = f"syn_{stem}_{defect_type}_{i:04d}.png"
             out_img_path = out_dir / out_name
-            gen_img.save(out_img_path)
+
+            # Bỏ qua nếu ảnh đã được sinh từ trước (hỗ trợ khôi phục tiến trình)
+            if not (out_img_path.exists() and out_img_path.stat().st_size > 1024):
+                gen_img = self.generate(
+                    normal_image=normal_img_path,
+                    defect_mask=mask_path,
+                    defect_type=defect_type,
+                )
+                gen_img.save(out_img_path)
 
             gen_records.append({
                 "synthetic_image_path": str(out_img_path.resolve()),
