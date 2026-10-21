@@ -79,42 +79,42 @@ python run_pipeline.py prepare_data
 
 ## Cách chạy Pipeline
 
-### Cách 1: Chạy trực tiếp trên Google Colab với GPU (Khuyên dùng)
+### Cách 1: Chạy trên Kaggle với GPU 2x T4 (Khuyên dùng nhất — Có thể tắt máy tính)
 
-Dự án đã tích hợp sẵn notebook [`run_on_colab.ipynb`](run_on_colab.ipynb). Bạn có thể mở trực tiếp bằng 1 cú click:
+Dự án tích hợp sẵn notebook [`run_on_kaggle.ipynb`](run_on_kaggle.ipynb) được tối ưu hóa cho môi trường Kaggle với **GPU 2x T4 (Dual GPU - 30GB VRAM)**.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/amebett1/diffusion/blob/main/run_on_colab.ipynb)
+#### 💡 Tại sao nên chọn Kaggle thay vì Google Colab?
+- **Tắt máy tính hoàn toàn khi train**: Google Colab bắt buộc phải giữ tab trình duyệt luôn mở (`on-screen`). Với Kaggle, bạn chỉ cần bấm **`Save Version`** $\rightarrow$ chọn **`Save & Run All (Commit)`** $\rightarrow$ **tắt máy tính đi ngủ**! Máy chủ Kaggle sẽ chạy ngầm toàn bộ pipeline (tối đa 9–12 giờ) và tự động lưu toàn bộ trọng số, ảnh sinh và báo cáo đối chuẩn.
+- **Tài nguyên GPU 2x T4**: Cung cấp miễn phí 30 giờ/tuần với cấu hình Dual GPU T4 x2 (30GB VRAM) hoặc P100 (16GB VRAM).
+- **Cơ chế tự động khôi phục (`--resume`)**: Nếu phiên chạy bị gián đoạn, pipeline tự động nhận diện các giai đoạn đã hoàn tất và tiếp tục chính xác công đoạn đang dang dở.
 
-#### Hướng dẫn từng bước thao tác trên Google Colab:
-1. **Mở Notebook:**
-   - Bấm vào nút **Open In Colab** ở trên, hoặc truy cập [Google Colab](https://colab.research.google.com/) $\rightarrow$ Chọn thẻ **GitHub** $\rightarrow$ Nhập `https://github.com/amebett1/diffusion` $\rightarrow$ Chọn file `run_on_colab.ipynb`.
-2. **Bật GPU T4:**
-   - Trên thanh menu trên cùng của Colab: Chọn **Runtime** (Thời lượng) $\rightarrow$ **Change runtime type** (Thay đổi loại phần cứng).
-   - Tại mục **Hardware accelerator**, chọn **T4 GPU** $\rightarrow$ Bấm **Save (Lưu)**.
-3. **Cung cấp link tải Dataset (Tại Bước 1 trong notebook):**
-   - Tìm đến ô code **Bước 1 (Clone Mã Nguồn từ GitHub & Chuẩn bị Dataset)**.
-   - Dán đường link tải dataset do tác giả gửi vào biến:
-     ```python
-     DATASET_LINK = "https://link-tai-dataset-cua-ban"
-     ```
-   - *(Nếu lưu file zip trên Drive cá nhân, bạn có thể mount Google Drive và giải nén như hướng dẫn trong ô code)*.
-4. **Bấm chạy toàn bộ (Run all):**
-   - Trên thanh menu của Colab, chọn **Runtime** $\rightarrow$ Bấm **Run all** (hoặc bấm tổ hợp phím tắt **`Ctrl + F9`** trên Windows / **`Cmd + F9`** trên Mac).
-   - *(Hoặc bạn có thể bấm nút Play ở bên trái từng ô code theo thứ tự từ trên xuống dưới)*.
-
-#### Quá trình tự động diễn ra sau khi bấm Run all:
-- **Bước 1**: Tự động clone code từ GitHub và tải/giải nén dataset vào `data/pcb-defect-dataset/`.
-- **Bước 2**: Tự động cài đặt đầy đủ các thư viện (`diffusers`, `ultralytics`, `accelerate`,...).
-- **Bước 3**: Tự động phân chia ID/NPI splits và sinh 799 ảnh phôi sạch (`data/pcb_normal/`).
-- **Bước 4**: Tự động huấn luyện CAMG (Step 1), LoRA Inpainting (Step 2) và YOLO11 Judge Lọc ảnh (Step 3).
-- **Bước 5**: Tự động huấn luyện và đánh giá đối chứng mô hình YOLO11 (Step 4 Benchmark ~45 phút).
-- **Bước 6**: Tự động hiển thị bảng so sánh chi tiết Precision, Recall, mAP@50 (tái lập Table 3 bài báo) và hiển thị ảnh khuyết tật trực quan.
-- **Bước 7**: Tự động sao lưu toàn bộ kết quả, trọng số tốt nhất (`best.pt`) và ảnh sinh về Google Drive của bạn.
+#### Các bước thực hiện trên Kaggle:
+1. **Tạo Notebook mới trên Kaggle**:
+   - Truy cập [Kaggle Kernels](https://www.kaggle.com/code) $\rightarrow$ Chọn **New Notebook**.
+   - Bấm **File** $\rightarrow$ **Import Notebook** $\rightarrow$ Tải lên file [`run_on_kaggle.ipynb`](run_on_kaggle.ipynb) từ repo.
+2. **Cấu hình Accelerator GPU 2x T4 (Menu Settings bên phải)**:
+   - **Accelerator**: Chọn **GPU T4 x2** (hoặc GPU P100).
+   - **Internet**: Bật **On** (để clone mã nguồn và tải pretrained models).
+   - **Persistence**: Chọn **Files only**.
+3. **Chạy ngầm toàn bộ (One-Click Background Run)**:
+   - Bấm nút **`Save Version`** ở góc trên cùng bên phải.
+   - Chọn **`Save & Run All (Commit)`** $\rightarrow$ Bấm **Save**.
+   - **Bạn có thể đóng trình duyệt và tắt máy tính!** Sau khi hoàn tất, kết quả sẽ sẵn sàng để tải về trong tab *Output*.
 
 ---
 
-### Cách 2: Chạy toàn bộ Pipeline bằng Command Line (One-Click Full)
-Chạy toàn bộ quá trình sinh ảnh và tự động benchmark:
+### Cách 2: Chạy trực tiếp trên Google Colab với GPU T4
+
+Nếu bạn muốn chạy trên Google Colab, sử dụng notebook [`run_on_colab.ipynb`](run_on_colab.ipynb):
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/amebett1/diffusion/blob/main/run_on_colab.ipynb)
+
+> **Lưu ý**: Khi chạy trên Colab, bạn cần giữ tab trình duyệt hoạt động trong suốt quá trình chạy.
+
+---
+
+### Cách 3: Chạy toàn bộ Pipeline bằng Command Line (One-Click Full & Resume)
+Chạy toàn bộ quá trình sinh ảnh và tự động benchmark, tự động ghi nhận checkpoint và khôi phục khi cần:
 ```bash
 python run_pipeline.py full \
     --image_dir data/pcb_normal \
@@ -132,12 +132,18 @@ python run_pipeline.py full \
     --run_benchmark \
     --benchmark_models yolo11 \
     --benchmark_epochs 100 \
+    --resume \
     --device cuda
 ```
 
----
+Kiểm tra bảng trạng thái tiến trình của pipeline bất kỳ lúc nào:
+```bash
+python run_pipeline.py status --output_dir outputs/pcb_synthesis
+```
 
-### Cách 3: Chạy từng bước độc lập
+### Cách 4: Chạy từng bước độc lập (Modular CLI Execution)
+
+Bạn có thể chạy riêng lẻ từng công đoạn hoặc dùng cờ `--from_stage` / `--to_stage` trong lệnh `python run_pipeline.py full --from_stage 2b --to_stage 3`:
 
 #### Bước 1: Sinh Mask bằng CAMG (Context-Aware Mask Generation)
 ```bash

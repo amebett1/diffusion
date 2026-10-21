@@ -35,6 +35,7 @@ from typing import List, Dict, Tuple, Optional, Union
 import cv2
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -363,7 +364,7 @@ class YOLO11ConfidenceScorer:
 
     def score_batch(self, records: List[Dict]) -> List[float]:
         """Chấm điểm danh sách records ảnh."""
-        return [self.score_record(rec) for rec in records]
+        return [self.score_record(rec) for rec in tqdm(records, desc="Chấm điểm tin cậy YOLO11 (Quality Scorer)", unit="ảnh")]
 
 
 # ─────────────────────────────────────────────────────────

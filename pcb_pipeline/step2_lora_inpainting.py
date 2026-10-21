@@ -43,6 +43,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -568,7 +569,8 @@ class LoRAInpaintTrainer:
             accum_steps = 0
             self.optimizer.zero_grad()
 
-            for step, batch in enumerate(dataloader):
+            pbar_loader = tqdm(dataloader, desc=f"Epoch [{epoch}/{epochs}] [LoRA Dual-Loss]", leave=False, unit="mẫu")
+            for step, batch in enumerate(pbar_loader):
                 images = batch["image"].to(self.device)   # (1, 3, 512, 512)
                 masks = batch["mask"].to(self.device)     # (1, 1, 512, 512)
                 defect_type = batch["defect_type"][0]
@@ -638,6 +640,7 @@ class LoRAInpaintTrainer:
                 scaled_loss.backward()
                 accum_steps += 1
                 epoch_loss += loss.item()
+                pbar_loader.set_postfix({"loss": f"{loss.item():.4f}", "l_def": f"{l_def.item():.4f}", "l_rec": f"{l_rec.item():.4f}"})
 
                 if accum_steps % batch_size == 0 or step == len(dataloader) - 1:
                     # Triệt tiêu gradient token thường của CLIP, bảo toàn 6 token TI
@@ -836,7 +839,8 @@ class PCBDefectInpainter:
             latents = torch.randn_like(z0_orig)
 
             # 5. VÒNG LẶP KHỬ NHIỄU 50 BƯỚC + LATENT OVERWRITING
-            for i, t in enumerate(timesteps):
+            pbar_denoise = tqdm(timesteps, desc=f"Khử nhiễu ({defect_type})", leave=False, unit="step")
+            for i, t in enumerate(pbar_denoise):
                 latent_model_input = torch.cat([latents] * 2)
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
@@ -904,7 +908,7 @@ class PCBDefectInpainter:
         logger.info(f"[Step 2] Bắt đầu sinh {len(mask_records)} ảnh lỗi tổng hợp...")
         gen_records = []
 
-        for i, rec in enumerate(mask_records):
+        for i, rec in enumerate(tqdm(mask_records, desc="Khuếch tán sinh ảnh lỗi (Inpainting)", unit="ảnh")):
             normal_img_path = rec["normal_image_path"]
             mask_path = rec["mask_path"]
             defect_type = rec["defect_type"]

@@ -27,6 +27,7 @@ from collections import Counter, defaultdict
 
 import cv2
 import numpy as np
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +324,7 @@ class PCBDataModule:
             idx += 1
 
         generated_paths = []
+        pbar = tqdm(total=target_count, desc="Sinh ảnh phôi sạch (Telea Inpainting)", unit="ảnh")
         for i, rec in enumerate(selected_records):
             img = cv2.imread(rec["image_path"])
             if img is None:
@@ -351,10 +353,12 @@ class PCBDataModule:
             out_path = output_dir / out_filename
             cv2.imwrite(str(out_path), normal_img)
             generated_paths.append(out_path)
+            pbar.update(1)
 
             if len(generated_paths) >= target_count:
                 break
 
+        pbar.close()
         logger.info(f"Đã tạo thành công {len(generated_paths)} ảnh normal vào {output_dir}")
         return generated_paths
 

@@ -42,6 +42,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -347,7 +348,8 @@ class CAMGTrainer:
 
             self.optimizer.zero_grad()
 
-            for step, batch in enumerate(dataloader):
+            pbar_epoch = tqdm(dataloader, desc=f"Epoch [{epoch}/{epochs}] [CAMG]", leave=False, unit="mẫu")
+            for step, batch in enumerate(pbar_epoch):
                 img = batch["image"].unsqueeze(0).to(self.device)  # (1, 3, H, W)
                 pos = batch["pos_patches"]                          # List[Dict]
                 neg = batch["neg_patches"]                          # List[Dict]
@@ -572,6 +574,8 @@ class CAMGGenerator:
 
         logger.info(f"[CAMG] Đang sinh masks cho {len(images)} ảnh, {len(defect_types)} loại lỗi...")
         records = []
+        total_masks = len(images) * len(defect_types) * images_per_defect
+        pbar_masks = tqdm(total=total_masks, desc="Sinh mask khuyết tật (CAMG Top-k)", unit="mask")
 
         for img_path in images:
             pil_img = Image.open(img_path).convert("RGB")
@@ -595,6 +599,9 @@ class CAMGGenerator:
                         "bbox_norm": res["bbox_norm"],
                     }
                     records.append(record)
+                    pbar_masks.update(1)
+
+        pbar_masks.close()
 
         meta_path = out_dir / "mask_metadata.json"
         with open(meta_path, "w", encoding="utf-8") as f:

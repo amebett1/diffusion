@@ -30,6 +30,7 @@ import time
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Tuple
+from tqdm import tqdm
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -279,7 +280,7 @@ class DownstreamBenchmarker:
             "comparisons": {},
         }
 
-        for model_name in models:
+        for model_name in tqdm(models, desc="Đánh giá Downstream Benchmark", unit="model"):
             norm_name = model_name.lower().strip()
             exp_base = f"{split_name}_{norm_name}_baseline"
             exp_aug = f"{split_name}_{norm_name}_augmented"

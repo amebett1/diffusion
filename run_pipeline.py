@@ -102,6 +102,168 @@ def save_config(cfg: dict, output_dir: Path):
 
 
 # ─────────────────────────────────────────────────────────
+# GPU Detection & Status Logging
+# ─────────────────────────────────────────────────────────
+def log_gpu_info():
+    """Kiểm tra và ghi log cấu hình GPU khả dụng (hỗ trợ Dual GPU Kaggle 2x T4)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            count = torch.cuda.device_count()
+            logger.info("=" * 70)
+            logger.info(f"PHÁT HIỆN HỆ THỐNG GPU CUDA: {count} GPU khả dụng")
+            for i in range(count):
+                props = torch.cuda.get_device_properties(i)
+                vram_gb = props.total_memory / (1024 ** 3)
+                logger.info(f"   [GPU {i}] {props.name} | VRAM: {vram_gb:.1f} GB")
+            if count >= 2:
+                logger.info("   -> Phát hiện Dual GPU (Kaggle 2x T4): Sẵn sàng tăng tốc huấn luyện & sinh ảnh!")
+            logger.info("=" * 70)
+        else:
+            logger.warning("Không tìm thấy GPU CUDA. Pipeline sẽ chạy trên CPU.")
+    except Exception as e:
+        logger.debug(f"Không thể kiểm tra GPU: {e}")
+
+
+# ─────────────────────────────────────────────────────────
+# Pipeline Checkpoint & Modular State Manager
+# ─────────────────────────────────────────────────────────
+class PipelineCheckpointManager:
+    """Quản lý tiến trình, lưu checkpoint trạng thái và hỗ trợ khôi phục (--resume)."""
+
+    STAGE_DEFS = [
+        ("0",  "Data Prep & 799 Normals", "data/id_setup.yaml"),
+        ("1",  "CAMG Mask Generation",    "outputs/pcb_synthesis/masks/mask_metadata.json"),
+        ("2a", "LoRA Fine-tuning",        "outputs/pcb_synthesis/lora_checkpoints"),
+        ("2b", "Diffusion Inpainting",    "outputs/pcb_synthesis/generated/generated_metadata.json"),
+        ("3",  "Quality Filtering",       "outputs/pcb_synthesis/filtered/augmented_dataset.yaml"),
+        ("4",  "Downstream Benchmark",    "outputs/pcb_synthesis/benchmark/benchmark_report.md"),
+    ]
+
+    STAGE_KEYS = [s[0] for s in STAGE_DEFS]
+
+    ALIASES = {
+        "0": "0", "prep": "0", "data": "0", "prepare_data": "0",
+        "1": "1", "mask": "1", "masks": "1", "camg": "1", "step1": "1",
+        "2a": "2a", "lora": "2a", "lora_train": "2a", "step2a": "2a",
+        "2b": "2b", "inpaint": "2b", "generate": "2b", "step2b": "2b",
+        "3": "3", "filter": "3", "quality_filter": "3", "step3": "3",
+        "4": "4", "benchmark": "4", "bench": "4", "step4": "4",
+    }
+
+    def __init__(self, output_dir: Path | str):
+        self.output_dir = Path(output_dir)
+        self.status_file = self.output_dir / "pipeline_status.json"
+        self.status_data = self._load()
+
+    def _load(self) -> dict:
+        if self.status_file.exists():
+            try:
+                with open(self.status_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"updated_at": None, "stages": {}}
+
+    def save(self):
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.status_data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(self.status_file, "w", encoding="utf-8") as f:
+            json.dump(self.status_data, f, indent=2, ensure_ascii=False)
+
+    def is_completed(self, stage_id: str, artifact_path: str | Path | None = None) -> bool:
+        stages = self.status_data.get("stages", {})
+        info = stages.get(stage_id, {})
+        chk = artifact_path or info.get("target_artifact")
+        if chk:
+            p = Path(chk)
+            if p.exists():
+                if p.is_dir():
+                    if any(p.iterdir()):
+                        return True
+                elif p.stat().st_size > 0:
+                    return True
+        return info.get("status") == "COMPLETED"
+
+    def mark_stage(self, stage_id: str, status: str, elapsed: float = 0.0, artifact: str | None = None, extra: dict | None = None):
+        if "stages" not in self.status_data:
+            self.status_data["stages"] = {}
+        stage_entry = self.status_data["stages"].get(stage_id, {})
+        stage_entry.update({
+            "status": status,
+            "elapsed_seconds": round(elapsed, 1),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "target_artifact": str(artifact) if artifact else stage_entry.get("target_artifact"),
+        })
+        if extra:
+            stage_entry.update(extra)
+        self.status_data["stages"][stage_id] = stage_entry
+        self.save()
+
+    def should_execute(self, stage_id: str, from_stage: str | None, to_stage: str | None) -> bool:
+        sid = self.ALIASES.get(str(stage_id).lower(), stage_id)
+        if sid not in self.STAGE_KEYS:
+            return True
+        idx = self.STAGE_KEYS.index(sid)
+
+        if from_stage:
+            f_id = self.ALIASES.get(str(from_stage).lower(), from_stage)
+            if f_id in self.STAGE_KEYS:
+                if idx < self.STAGE_KEYS.index(f_id):
+                    return False
+
+        if to_stage:
+            t_id = self.ALIASES.get(str(to_stage).lower(), to_stage)
+            if t_id in self.STAGE_KEYS:
+                if idx > self.STAGE_KEYS.index(t_id):
+                    return False
+
+        return True
+
+    def render_dashboard(self) -> str:
+        lines = []
+        bar = "=" * 82
+        sep = "-" * 82
+        lines.append(bar)
+        lines.append(f"{'PCB DEFECT SYNTHESIS PIPELINE EXECUTION DASHBOARD':^82}")
+        lines.append(bar)
+        header = f"{'Stage':<6} {'Tên công đoạn':<25} {'Trạng thái':<14} {'Thời gian':<12} {'Output / Artifact':<22}"
+        lines.append(header)
+        lines.append(sep)
+
+        for sid, name, default_art in self.STAGE_DEFS:
+            stage_entry = self.status_data.get("stages", {}).get(sid, {})
+            status = stage_entry.get("status", "PENDING")
+            elapsed_sec = stage_entry.get("elapsed_seconds", None)
+            art = stage_entry.get("target_artifact", default_art)
+            art_name = Path(art).name if art else "-"
+
+            if status == "COMPLETED":
+                status_str = "[HOÀN TẤT]"
+            elif status == "RUNNING":
+                status_str = "[ĐANG CHẠY...]"
+            elif status == "SKIPPED":
+                status_str = "[BỎ QUA]"
+            else:
+                status_str = "[CHƯA CHẠY]"
+
+            if elapsed_sec is not None and elapsed_sec > 0:
+                if elapsed_sec >= 3600:
+                    time_str = f"{int(elapsed_sec//3600)}h {int((elapsed_sec%3600)//60)}m"
+                elif elapsed_sec >= 60:
+                    time_str = f"{int(elapsed_sec//60)}m {int(elapsed_sec%60)}s"
+                else:
+                    time_str = f"{elapsed_sec:.1f}s"
+            else:
+                time_str = "--"
+
+            lines.append(f"{sid:<6} {name:<25} {status_str:<14} {time_str:<12} {art_name:<22}")
+
+        lines.append(bar)
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────
 # STEP 1: Mask Generation (CAMG)
 # ─────────────────────────────────────────────────────────
 def run_step1_train(args, cfg: dict) -> str:
@@ -313,58 +475,221 @@ def run_full_pipeline(args, cfg: dict):
     out.mkdir(parents=True, exist_ok=True)
     save_config(cfg, out)
 
+    manager = PipelineCheckpointManager(out)
+    log_gpu_info()
+
     logger.info("Bắt đầu PCB Defect Synthesis Pipeline")
-    logger.info(f"   Output: {out.resolve()}")
+    logger.info(f"   Thư mục Output: {out.resolve()}")
+    logger.info("\n" + manager.render_dashboard())
     t_start = time.time()
 
-    # Tự động kiểm tra ảnh sạch pcb_normal
+    resume = getattr(args, "resume", False)
+    from_st = getattr(args, "from_stage", None)
+    to_st = getattr(args, "to_stage", None)
+
+    # ─────────────────────────────────────────────────────
+    # STAGE 0: Data Prep (ID/NPI splits + 799 normal images)
+    # ─────────────────────────────────────────────────────
     img_dir = Path(args.image_dir)
-    if not img_dir.exists() or len(list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))) == 0:
-        raw_dir = Path("data/pcb-defect-dataset")
-        if raw_dir.exists():
-            logger.info(f"Chưa tìm thấy ảnh sạch trong '{img_dir}'. Đang tự động tạo 799 ảnh normal theo chuẩn bài báo...")
-            from pcb_pipeline.data_module import PCBDataModule
-            dm = PCBDataModule(raw_dataset_dir=raw_dir, output_dir="data")
-            dm.run_pipeline()
+    has_normals = img_dir.exists() and len(list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))) > 0
+    id_yaml = Path("data/id_setup.yaml")
+
+    if manager.should_execute("0", from_st, to_st):
+        if resume and has_normals and id_yaml.exists():
+            logger.info("[RESUME] Stage 0 (Data Prep) đã có 799 ảnh phôi sạch & ID setup. Bỏ qua.")
+            manager.mark_stage("0", "COMPLETED", artifact=str(id_yaml))
+        elif not has_normals:
+            raw_dir = Path("data/pcb-defect-dataset")
+            if raw_dir.exists():
+                logger.info(f"Chưa tìm thấy ảnh sạch trong '{img_dir}'. Đang tự động tạo 799 ảnh normal theo chuẩn bài báo...")
+                manager.mark_stage("0", "RUNNING")
+                t0 = time.time()
+                from pcb_pipeline.data_module import PCBDataModule
+                dm = PCBDataModule(raw_dataset_dir=raw_dir, output_dir="data")
+                dm.run_pipeline()
+                manager.mark_stage("0", "COMPLETED", elapsed=time.time() - t0, artifact=str(id_yaml))
+            else:
+                raise FileNotFoundError(
+                    f"Không tìm thấy thư mục '{img_dir}' và cũng không tìm thấy '{raw_dir}'.\n"
+                    f"Hãy tải dataset và giải nén vào 'data/pcb-defect-dataset/', sau đó chạy 'python run_pipeline.py prepare_data'!"
+                )
         else:
-            raise FileNotFoundError(
-                f"Không tìm thấy thư mục '{img_dir}' và cũng không tìm thấy '{raw_dir}'.\n"
-                f"Hãy tải dataset và giải nén vào 'data/pcb-defect-dataset/', sau đó chạy 'python run_pipeline.py prepare_data'!"
-            )
+            manager.mark_stage("0", "COMPLETED", artifact=str(id_yaml))
+    else:
+        logger.info("[SKIP] Bỏ qua Stage 0 theo cấu hình stage.")
+        manager.mark_stage("0", "SKIPPED")
 
-    # Step 1: Mask Generation
-    mask_records = run_step1(args, cfg)
+    # ─────────────────────────────────────────────────────
+    # STAGE 1: CAMG Mask Generation
+    # ─────────────────────────────────────────────────────
+    mask_records = []
+    mask_meta_path = out / "masks" / "mask_metadata.json"
 
-    # Step 2a: LoRA Training (nếu cần)
-    if not getattr(args, "lora_ckpt", None) and getattr(args, "real_defect_dir", None):
-        args.lora_ckpt = run_step2_train(args, cfg)
+    if manager.should_execute("1", from_st, to_st):
+        if resume and mask_meta_path.exists() and mask_meta_path.stat().st_size > 0:
+            try:
+                with open(mask_meta_path, "r", encoding="utf-8") as f:
+                    mask_records = json.load(f)
+                if mask_records and len(mask_records) > 0:
+                    logger.info(f"[RESUME] Stage 1 (CAMG Masks) đã có sẵn {len(mask_records)} masks tại: {mask_meta_path}. Tái sử dụng!")
+                    manager.mark_stage("1", "COMPLETED", artifact=str(mask_meta_path), extra={"count": len(mask_records)})
+            except Exception as e:
+                logger.warning(f"Lỗi đọc mask metadata cũ: {e}. Đang sinh lại...")
 
-    # Step 2b: Image Synthesis
-    gen_records = run_step2_generate(mask_records, args, cfg)
+        if not mask_records:
+            manager.mark_stage("1", "RUNNING")
+            t0 = time.time()
+            mask_records = run_step1(args, cfg)
+            manager.mark_stage("1", "COMPLETED", elapsed=time.time() - t0, artifact=str(mask_meta_path), extra={"count": len(mask_records)})
+    else:
+        logger.info("[SKIP] Bỏ qua Stage 1 theo cấu hình stage.")
+        manager.mark_stage("1", "SKIPPED")
+        if mask_meta_path.exists():
+            try:
+                with open(mask_meta_path, "r", encoding="utf-8") as f:
+                    mask_records = json.load(f)
+            except Exception:
+                pass
 
-    # Step 3: Quality Filtering
-    final_records = run_step3(gen_records, args, cfg)
+    # ─────────────────────────────────────────────────────
+    # STAGE 2a: LoRA & Textual Inversion Training
+    # ─────────────────────────────────────────────────────
+    lora_ckpt_target = getattr(args, "lora_ckpt", None)
+    if not lora_ckpt_target:
+        candidate_lora = out / "lora_checkpoints" / "epoch_010"
+        if candidate_lora.exists():
+            lora_ckpt_target = str(candidate_lora)
+        else:
+            cand_root = out / "lora_checkpoints"
+            if cand_root.exists() and any(cand_root.iterdir()):
+                lora_ckpt_target = str(cand_root)
 
-    # Step 4: Downstream Benchmark (nếu yêu cầu qua cờ --run_benchmark)
-    benchmark_results = None
+    if manager.should_execute("2a", from_st, to_st):
+        if resume and lora_ckpt_target and Path(lora_ckpt_target).exists():
+            logger.info(f"[RESUME] Stage 2a (LoRA Checkpoint) đã có sẵn tại: {lora_ckpt_target}. Bỏ qua huấn luyện.")
+            args.lora_ckpt = lora_ckpt_target
+            manager.mark_stage("2a", "COMPLETED", artifact=str(lora_ckpt_target))
+        elif not getattr(args, "lora_ckpt", None) and getattr(args, "real_defect_dir", None):
+            manager.mark_stage("2a", "RUNNING")
+            t0 = time.time()
+            args.lora_ckpt = run_step2_train(args, cfg)
+            manager.mark_stage("2a", "COMPLETED", elapsed=time.time() - t0, artifact=str(args.lora_ckpt or out / "lora_checkpoints"))
+        else:
+            manager.mark_stage("2a", "SKIPPED", artifact=str(args.lora_ckpt or "Không train"))
+    else:
+        logger.info("[SKIP] Bỏ qua Stage 2a theo cấu hình stage.")
+        manager.mark_stage("2a", "SKIPPED")
+        if lora_ckpt_target:
+            args.lora_ckpt = lora_ckpt_target
+
+    # ─────────────────────────────────────────────────────
+    # STAGE 2b: Diffusion Inpainting Synthesis
+    # ─────────────────────────────────────────────────────
+    gen_records = []
+    gen_meta_path = out / "generated" / "generated_metadata.json"
+
+    if manager.should_execute("2b", from_st, to_st):
+        if resume and gen_meta_path.exists() and gen_meta_path.stat().st_size > 0:
+            try:
+                with open(gen_meta_path, "r", encoding="utf-8") as f:
+                    gen_records = json.load(f)
+                if gen_records and len(gen_records) > 0:
+                    logger.info(f"[RESUME] Stage 2b (Diffusion Inpaint) đã có sẵn {len(gen_records)} ảnh tại: {gen_meta_path}. Tái sử dụng!")
+                    manager.mark_stage("2b", "COMPLETED", artifact=str(gen_meta_path), extra={"count": len(gen_records)})
+            except Exception as e:
+                logger.warning(f"Lỗi đọc generated metadata cũ: {e}. Đang sinh lại...")
+
+        if not gen_records:
+            if not mask_records:
+                raise RuntimeError("Không có mask_records từ Stage 1 để sinh ảnh!")
+            manager.mark_stage("2b", "RUNNING")
+            t0 = time.time()
+            gen_records = run_step2_generate(mask_records, args, cfg)
+            manager.mark_stage("2b", "COMPLETED", elapsed=time.time() - t0, artifact=str(gen_meta_path), extra={"count": len(gen_records)})
+    else:
+        logger.info("[SKIP] Bỏ qua Stage 2b theo cấu hình stage.")
+        manager.mark_stage("2b", "SKIPPED")
+        if gen_meta_path.exists():
+            try:
+                with open(gen_meta_path, "r", encoding="utf-8") as f:
+                    gen_records = json.load(f)
+            except Exception:
+                pass
+
+    # ─────────────────────────────────────────────────────
+    # STAGE 3: Quality Filtering (YOLO11s)
+    # ─────────────────────────────────────────────────────
+    final_records = []
     aug_yaml_path = out / "filtered" / "augmented_dataset.yaml"
-    if getattr(args, "run_benchmark", False):
-        setattr(args, "models", getattr(args, "benchmark_models", ["yolo11"]))
-        setattr(args, "epochs", getattr(args, "benchmark_epochs", 100))
-        setattr(args, "aug_yaml", str(aug_yaml_path))
-        benchmark_results = run_step4(args, cfg)
+    acc_meta_path = out / "filtered" / "accepted_metadata.json"
 
-    # Tổng kết
+    if manager.should_execute("3", from_st, to_st):
+        if resume and aug_yaml_path.exists() and acc_meta_path.exists():
+            try:
+                with open(acc_meta_path, "r", encoding="utf-8") as f:
+                    final_records = json.load(f)
+                if final_records and len(final_records) > 0:
+                    logger.info(f"[RESUME] Stage 3 (Quality Filter) đã có sẵn {len(final_records)} ảnh accepted tại: {aug_yaml_path}. Tái sử dụng!")
+                    manager.mark_stage("3", "COMPLETED", artifact=str(aug_yaml_path), extra={"count": len(final_records)})
+            except Exception as e:
+                logger.warning(f"Lỗi đọc filter metadata cũ: {e}. Đang lọc lại...")
+
+        if not final_records:
+            if not gen_records:
+                raise RuntimeError("Không có gen_records từ Stage 2b để lọc chất lượng!")
+            manager.mark_stage("3", "RUNNING")
+            t0 = time.time()
+            final_records = run_step3(gen_records, args, cfg)
+            manager.mark_stage("3", "COMPLETED", elapsed=time.time() - t0, artifact=str(aug_yaml_path), extra={"count": len(final_records)})
+    else:
+        logger.info("[SKIP] Bỏ qua Stage 3 theo cấu hình stage.")
+        manager.mark_stage("3", "SKIPPED")
+        if acc_meta_path.exists():
+            try:
+                with open(acc_meta_path, "r", encoding="utf-8") as f:
+                    final_records = json.load(f)
+            except Exception:
+                pass
+
+    # ─────────────────────────────────────────────────────
+    # STAGE 4: Downstream Benchmark
+    # ─────────────────────────────────────────────────────
+    benchmark_results = None
+    bench_report_path = out / "benchmark" / "benchmark_report.md"
+
+    if getattr(args, "run_benchmark", False) and manager.should_execute("4", from_st, to_st):
+        if resume and bench_report_path.exists() and bench_report_path.stat().st_size > 0:
+            logger.info(f"[RESUME] Stage 4 (Downstream Benchmark) đã hoàn tất tại: {bench_report_path}. Bỏ qua.")
+            manager.mark_stage("4", "COMPLETED", artifact=str(bench_report_path))
+            benchmark_results = {"report": str(bench_report_path)}
+        else:
+            manager.mark_stage("4", "RUNNING")
+            t0 = time.time()
+            setattr(args, "models", getattr(args, "benchmark_models", ["yolo11"]))
+            setattr(args, "epochs", getattr(args, "benchmark_epochs", 100))
+            setattr(args, "aug_yaml", str(aug_yaml_path))
+            benchmark_results = run_step4(args, cfg)
+            manager.mark_stage("4", "COMPLETED", elapsed=time.time() - t0, artifact=str(bench_report_path))
+    else:
+        if not getattr(args, "run_benchmark", False):
+            manager.mark_stage("4", "SKIPPED", artifact="Không kích hoạt (--run_benchmark)")
+        else:
+            manager.mark_stage("4", "SKIPPED")
+
+    # ─────────────────────────────────────────────────────
+    # Tổng kết & Dashboard cuối cùng
+    # ─────────────────────────────────────────────────────
     elapsed = time.time() - t_start
+    logger.info("\n" + manager.render_dashboard())
     logger.info("=" * 60)
-    logger.info("PIPELINE HOÀN TẤT")
-    logger.info(f"   Tổng thời gian: {elapsed/60:.1f} phút")
-    logger.info(f"   Ảnh sau lọc:   {len(final_records)}")
+    logger.info("PIPELINE EXECUTION HOÀN TẤT")
+    logger.info(f"   Tổng thời gian phiên:    {elapsed/60:.1f} phút")
+    logger.info(f"   Ảnh sau lọc (Accepted):  {len(final_records)}")
     if aug_yaml_path.exists():
-        logger.info(f"   Augmented YAML: {aug_yaml_path.resolve()}")
+        logger.info(f"   Augmented YAML:          {aug_yaml_path.resolve()}")
     if benchmark_results:
-        logger.info(f"   Benchmark Dir:  {(out / 'benchmark').resolve()}")
-    logger.info(f"   Output:        {out.resolve()}")
+        logger.info(f"   Benchmark Report:        {bench_report_path.resolve()}")
+    logger.info(f"   Output Directory:        {out.resolve()}")
     logger.info("=" * 60)
 
     # Lưu report
@@ -377,6 +702,7 @@ def run_full_pipeline(args, cfg: dict):
         "benchmark_executed": bool(benchmark_results),
         "elapsed_minutes":    round(elapsed / 60, 1),
         "config":             cfg,
+        "stages":             manager.status_data.get("stages", {}),
     }
     (out / "pipeline_report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -510,6 +836,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_full.add_argument("--run_benchmark",    action="store_true", help="Tự động chạy Step 4 Benchmark sau khi hoàn tất Step 3")
     p_full.add_argument("--benchmark_models", nargs="+", default=["yolo11"], help="Danh sách mô hình benchmark khi chạy full (mặc định: yolo11)")
     p_full.add_argument("--benchmark_epochs", type=int, default=100, help="Số epochs benchmark cho mỗi model (mặc định 100 theo bài báo)")
+    p_full.add_argument("--resume",           action="store_true", help="Tự động khôi phục và bỏ qua các giai đoạn đã hoàn thành trước đó")
+    p_full.add_argument("--from_stage",       default=None, help="Bắt đầu từ giai đoạn cụ thể: 0 (prep), 1 (mask), 2a (lora), 2b (inpaint), 3 (filter), 4 (benchmark)")
+    p_full.add_argument("--to_stage",         default=None, help="Dừng lại sau giai đoạn cụ thể: 0, 1, 2a, 2b, 3, 4")
+
+    # ── status ───────────────────────────────────────────
+    p_stat = subparsers.add_parser("status", help="Xem bảng trạng thái dashboard tiến trình của pipeline")
+    p_stat.add_argument("--output_dir", default="outputs/pcb_synthesis", help="Thư mục output chứa pipeline_status.json")
 
     # ── step1_train ──────────────────────────────────────
     p1t = subparsers.add_parser("step1_train", help="Huấn luyện prediction heads của CAMG")
@@ -633,6 +966,10 @@ def main():
 
     elif args.command == "prepare_data":
         run_prepare_data(args, cfg)
+
+    elif args.command == "status":
+        manager = PipelineCheckpointManager(args.output_dir)
+        print("\n" + manager.render_dashboard())
 
 
 if __name__ == "__main__":
