@@ -1,10 +1,12 @@
 {
+  "split_protocol": "official_train_only_v2",
+  "normal_protocol": "clean_crop_or_verified_telea_v2",
   "total_raw_images": 10668,
-  "normal_images_count": 799,
-  "id_train_low_count": 668,
-  "id_val_count": 1180,
-  "npi_train_count": 668,
-  "npi_unseen_val_count": 2804,
+  "raw_split_counts": {
+    "train": 8534,
+    "val": 1066,
+    "test": 1068
+  },
   "seen_boards": [
     "01",
     "04",
@@ -19,13 +21,75 @@
     "11",
     "12"
   ],
-  "bbox_q1_width": 21.96,
+  "id_train_full_count": 5339,
+  "id_train_low_count": 534,
+  "id_val_count": 941,
+  "npi_train_count": 534,
+  "npi_unseen_val_count": 550,
+  "id_train_low_by_board": {
+    "01": 82,
+    "04": 114,
+    "05": 57,
+    "06": 62,
+    "07": 82,
+    "08": 68,
+    "09": 69
+  },
+  "id_train_low_by_class": {
+    "missing_hole": 160,
+    "mouse_bite": 210,
+    "open_circuit": 165,
+    "short": 148,
+    "spur": 170,
+    "spurious_copper": 144
+  },
+  "id_val_by_board": {
+    "01": 121,
+    "04": 201,
+    "05": 114,
+    "06": 122,
+    "07": 122,
+    "08": 132,
+    "09": 129
+  },
+  "npi_val_by_board": {
+    "10": 113,
+    "11": 224,
+    "12": 213
+  },
+  "normal_images_count": 799,
+  "normal_method_counts": {
+    "telea_verified": 636,
+    "clean_crop": 163
+  },
+  "normal_source_boards": [
+    "01",
+    "04",
+    "05",
+    "06",
+    "07",
+    "08",
+    "09"
+  ],
+  "normal_source_splits": [
+    "train"
+  ],
+  "normal_manifest": "C:\\Users\\Lenovo\\Downloads\\diffusion\\diffusion\\data\\pcb_normal\\normal_manifest.json",
+  "bbox_q1_width": 21.000000000000004,
+  "bbox_median_width": 27.0,
   "bbox_q3_width": 36.0,
   "bbox_q1_height": 21.000000000000004,
-  "bbox_q3_height": 36.0,
+  "bbox_median_height": 27.0,
+  "bbox_q3_height": 34.98,
   "exported_files": {
-    "id_yaml": "data\\id_setup.yaml",
-    "npi_yaml": "data\\npi_setup.yaml",
-    "train_metadata": "data\\train_metadata.json"
-  }
+    "id_yaml": "C:\\Users\\Lenovo\\Downloads\\diffusion\\diffusion\\data\\id_setup.yaml",
+    "npi_yaml": "C:\\Users\\Lenovo\\Downloads\\diffusion\\diffusion\\data\\npi_setup.yaml",
+    "train_metadata": "C:\\Users\\Lenovo\\Downloads\\diffusion\\diffusion\\data\\train_metadata.json",
+    "id_train_low": "C:\\Users\\Lenovo\\Downloads\\diffusion\\diffusion\\data\\prepared_splits\\id_train_low.txt",
+    "id_train_full": "C:\\Users\\Lenovo\\Downloads\\diffusion\\diffusion\\data\\prepared_splits\\id_train_full.txt",
+    "id_val": "C:\\Users\\Lenovo\\Downloads\\diffusion\\diffusion\\data\\prepared_splits\\id_val.txt",
+    "npi_train_low": "C:\\Users\\Lenovo\\Downloads\\diffusion\\diffusion\\data\\prepared_splits\\npi_train_low.txt",
+    "npi_val_unseen": "C:\\Users\\Lenovo\\Downloads\\diffusion\\diffusion\\data\\prepared_splits\\npi_val_unseen.txt"
+  },
+  "limitations": "Repo chỉ có dữ liệu các board 01,04-09 (7 seen boards); paper mô tả 9 seen boards. Các board 02/03 không có trong raw dataset. Do đó số ảnh low-data và thành phần board không thể trùng khớp tuyệt đối paper."
 }

@@ -1,0 +1,1833 @@
+
+
+===== PAGE 1 =====
+Journal of Intelligent Manufacturing
+https://doi.org/10.1007/s10845-026-02915-2
+A Synthetic Defect Image Generation Method for Enhanced Industrial
+Defect Detection Based on Inpainting Diffusion and Context-aware
+Mask Generation
+Jaebong Cho1
+· Dohyeon Kong1
+· Jihoon Nam1
+· Hyunbo Cho1
+Received: 1 February 2026 / Accepted: 13 June 2026
+© The Author(s) 2026
+Abstract
+Automated visual inspection (AVI) systems increasingly rely on deep learning-based object detection to deliver fast and
+consistent surface defect identiﬁcation. However, the scarcity of defect image data and the shift in visual feature distributions
+caused by product variations remain signiﬁcant challenges that hinder the practical deployment of deep learning systems.
+To address these challenges, we propose a synthetic defect generation pipeline based on an inpainting diffusion model. We
+introduce a Context-Aware Mask Generation (CAMG) module to ensure conforming mask generation required for realistic
+defect image synthesis. The proposed CAMG module employs a Self-DIstillation with NO labels (DINO) vision foundation
+model to automatically learn defect placement rules on product images. By synthesizing defects onto the non-defective
+images of new products via an inpainting approach, our method effectively bridges the distributional gap caused by product
+variations, enhancing robustness in New Product Introduction (NPI) scenarios. We validate the effectiveness of our method
+on footwear and printed circuit board (PCB) datasets. The experimental results demonstrate that incorporating the synthetic
+defect images consistently improves the mean average precision (mAP), precision, and recall performances of various defect
+detection models, with the most notable gains observed in the challenging NPI scenario.
+Keywords Synthetic Defect Image Generation · Defect Detection · Inpainting Diffusion · Automated Visual Inspection
+Introduction
+Automated visual inspection (AVI) systems based on deep
+learning object detection have become a core component
+of intelligent manufacturing, replacing the conventional
+manual visual inspection process. Recent studies have
+demonstrated promising detection performances in diverse
+B Hyunbo Cho
+hcho@postech.ac.kr
+Jaebong Cho
+jaycho00@postech.ac.kr
+Dohyeon Kong
+dohyeono@postech.ac.kr
+Jihoon Nam
+jihoonnam@postech.ac.kr
+1
+Department of Industrial and Management Engineering,
+Pohang University of Science and Technology, 77
+Chungam-Ro, Nam-Gu, Pohang-Si 37673,
+Kyungsangbuk-Do, Republic of Korea
+industrial domains such as semiconductors (Shinde et al.,
+2022), steel (Zhang et al., 2024), railroads (Ni et al., 2022),
+and agriculture (Lu et al., 2025). However, their practical
+adoption still faces signiﬁcant challenges in manufactur-
+ing sites. Speciﬁcally, manufacturers struggle with long
+lead times for data acquisition and performance degrada-
+tion due to the scarcity of defect data and frequent product
+changes in manufacturing environments. For example, in the
+footwear manufacturing industry, new product introduction
+(NPI) occurs frequently (Shen et al., 2020) due to changing
+demands, and a single production line commonly produces a
+wide range of products with diverse designs and colorways.
+Under this dynamic environment, defect detection models
+continuously face input images of products they have not
+been trained on. This persistent distribution shift causes a
+severe degradation in model performance (Lengyel et al.,
+2023; Yao et al., 2023). Moreover, acquiring real defect data
+can take several months or more, since defect image data
+is scarce in manufacturing sites (Garcia-Perez et al., 2025;
+Li et al., 2023). Consequently, this creates a performance
+123
+
+
+===== PAGE 2 =====
+Journal of Intelligent Manufacturing
+lag between the performance degradation and its subsequent
+recoveryasillustratedinFig.1,whichhindersthewidespread
+adoption of AVI systems across the industry.
+To overcome this challenge, we propose a data-centric
+strategy that enhances defect detection through synthetic
+defect image generation. The proposed method offers an
+advantage to manufacturers by accelerating data acquisi-
+tion and diversifying training datasets while minimizing the
+dependency on rare real-world defects. Notably, even for a
+newly introduced product for which no defect data exists,
+the proposed method requires only a small number of non-
+defective normal images, which can be rapidly acquired
+during the prototyping stage (De Giorgio et al., 2023). The
+generated synthetic images interpolate missing defect pat-
+terns within existing product lines, and extrapolate defect
+features to new products to bridge the distribution shift. As a
+result, the proposed method mitigates performance degrada-
+tion during the operational phase in dynamic manufacturing
+environments.
+To evaluate the proposed method under realistic indus-
+trial conditions, we conducted extensive evaluations on two
+distinct real-world industrial datasets, footwear and printed
+circuit board (PCB). These datasets were specially selected
+as they represent the target characteristics of our problem
+setting, multiple product variants within a single category,
+intricate sub-components, bounding box-level annotations,
+and highly localized defects. Experimental results conﬁrm
+that the proposed method consistently outperforms baseline
+methods, particularly in the challenging NPI scenario. Our
+approach achieved a signiﬁcant recall gain of up to 21.5 per-
+centage points on unseen products, highlighting its practical
+effectiveness in dynamic manufacturing environments. Fur-
+thermore, we provided a comprehensive analysis including
+quantitative evaluation of synthetic image quality and feature
+space visualization to verify the effectiveness of the proposed
+generation pipeline.
+The main contributions of our research are summarized
+as follows.
+1. We propose a fully automated synthetic defect generation
+pipeline that integrates Context-Aware Mask Generation
+(CAMG) with a ﬁne-tuned diffusion model, enabling
+the data-driven synthesis of contextually valid anomalies
+without manual intervention.
+2. We demonstrate the practical utility of our approach
+in real-world defect detection datasets, which are char-
+acterized by structural complexity, diverse designs and
+localized defects.
+3. Extensiveexperimentsvalidatethattheproposedpipeline
+consistently enhances the performance of various state-
+of-the-art defect detection models, effectively mitigating
+the problems of data scarcity and distribution shift in
+dynamic industrial environments.
+The remainder of this paper is organized as follows. Sec-
+tion Related Work reviews related work on synthetic defect
+image generation methods including inpainting diffusion that
+are central to our methodology. Section Methods explains
+the proposed method in detail. Section Experimental Results
+presents the experimental results, followed by comparative
+analysis and discussions. Finally, Section Conclusion con-
+cludes the paper and suggests directions for future research.
+Related Work
+Deep Learning for Industrial Defect Detection
+Deep learning-based object detectors, particularly single-
+stage methods based on You Only Look Once (YOLO) (Red-
+mon et al., 2016) and Detection Transformer (DETR) (Zhao
+et al., 2024) architectures, have been widely adopted for
+AVI systems. Their end-to-end architecture is suitable for
+real-time inference and multi-class defect detection, which
+is a critical requirement for in-line inspection in manufactur-
+ing. However, supervised object detectors rely on large-scale
+labeled datasets. Insufﬁcient training data and distribution
+shifts can result in a severe overﬁtting problem. Data aug-
+mentation (Wang et al., 2025) and domain adaptation (Wang
+et al., 2023) have been widely studied to overcome these chal-
+lenges. Although domain adaptation methods such as domain
+adversariallearning(Ganinetal.,2016;Lietal.,2023)enable
+end-to-end feature alignment between distinct input distri-
+butions, they require representative target domain samples
+during training, which is unavailable when no defect images
+of the target product exist prior to production. Moreover,
+these methods often focus on global feature alignment and
+may inadvertently suppress the ﬁne-grained local features
+essential for precise defect localization. Consequently, recent
+paradigms have shifted towards a generative data augmen-
+tation approach leveraging large-scale foundation models to
+enrich the existing dataset.
+Synthetic Defect Image Generation
+Data augmentation is a widely adopted strategy to address
+data scarcity in industrial defect detection. Early approaches
+utilized copy-and-paste methods (Li et al., 2021) and GAN-
+based methods (Zhang et al., 2021) to synthesize defect
+images. However, they often fail to generate realistic textures
+or seamless blends with the background. Recently, latent
+diffusion models (Rombach et al., 2022) have emerged as
+a powerful alternative, outperforming previous methods in
+generating high-ﬁdelity images. In particular, an inpainting
+diffusion model, a speciﬁc type of diffusion model that is
+trained to ﬁll the mask area seamlessly onto a given input
+image, showed strong capability to generate local defect
+123
+
+
+===== PAGE 3 =====
+Journal of Intelligent Manufacturing
+Fig. 1 Performance degradation
+of defect detection models in
+new product introduction case
+textures while preserving the structure of whole products.
+Previous studies such as AnoGen (Gui et al., 2025), Anoma-
+lyDiffusion (Hu et al., 2024), and DefectFill (Song et al.,
+2025) demonstrated the generative capability of inpainting
+diffusion models to enhance defect detection with synthetic
+defect images on academic benchmarks such as MVTEC-
+AD (Bergmann et al., 2019) and ViSA (Zou et al., 2022).
+Recent studies are also extending beyond standard bench-
+marks to applications on real-world datasets (Chen et al.,
+2025; Zeng et al., 2025).
+Mask Generation for Inpainting Diffusion
+In the application of inpainting diffusion models for defect
+image generation, mask generation serves as a critical step
+that determines the spatial location and the speciﬁc category
+of the defect to be synthesized. In various industrial domains,
+defect masks must be carefully located for defect image gen-
+eration. For instance, in our case study of footwear product
+defect detection, a ’Loose Thread End’ defect must be placed
+on semantically valid regions such as the stitching area, rather
+than on incompatible materials like the rubber sole. However,
+approaches for mask generation in previous studies show
+several limitations. Reusing defect masks from the training
+set or using custom-drawn masks can ensure mask valid-
+ity, but hinder the full automation of the data generation
+pipeline (Chen et al., 2025; Gui et al., 2025; Song et al.,
+2025). Foreground sampling (Choi et al., 2025; Rother et al.,
+2004) distinguishes products from the background, but lacks
+granularity for precise defect placement within product parts.
+Finally, while integrating mask generation directly into the
+generative model can be an effective strategy, such an end-to-
+end approach presents low interpretability (Hu et al., 2024).
+To address these problems, we introduce a learnable Context-
+Aware Mask Generation (CAMG) module that explicitly
+models the joint distribution of defect location, type, and size
+conditioned on the input image. Based on vision foundation
+model features, CAMG enables semantically consistent and
+contextually valid defect synthesis, particularly for industrial
+products with complex surface structures.
+Parameter-Efficient Fine-tuning for Diffusion Models
+While large-scale diffusion models possess strong generative
+capabilities, they are pre-trained on general-domain datasets
+and often lack the domain-speciﬁc knowledge required to
+represent industrial defects and complex product textures.
+Therefore, ﬁne-tuning is essential to bridge this gap and
+enable the model to capture the distinct visual characteristics
+of the target products.
+To achieve this while preserving the pre-trained capa-
+bilities, previous studies have explored various parameter-
+efﬁcient ﬁne-tuning strategies. In particular, Low-Rank
+adaptation (LoRA) (Hu et al., 2022) enables layer-wise
+ﬁne-tuning with a minimal number of learnable parameters.
+Textual Inversion (Gal et al., 2023) and Dreambooth (Ruiz et
+al., 2022) introduce learnable conditioning tokens to capture
+speciﬁc concepts. These methods enable ﬁne-tuning of large-
+scale generative models without the risk of overﬁtting even
+with a few-shot supervision. Drawing inspiration from these
+studies, our pipeline incorporates LoRA and textual inver-
+sion to adapt the inpainting diffusion model to the industrial
+domain.
+Methods
+The overall framework of the proposed synthetic defect
+image generation pipeline is illustrated in Fig. 2. A Context-
+Aware Mask Generation (CAMG) module and the inpaint-
+ing diffusion model is described in a diagram. Learnable,
+frozen, and partially learnable parameters are given in col-
+ors. Ic, Bc, ˆIc represent cropped images and masks.
+Context-Aware Mask Generation (CAMG)
+In products composed of multiple sub-components, the types
+of potential defects vary depending on the speciﬁc compo-
+nent. Injecting inappropriate masks during the generation
+stage results in semantically implausible images, which can
+ultimately hinder the effective training of defect detectors.
+123
+
+
+===== PAGE 4 =====
+Journal of Intelligent Manufacturing
+Fig. 2 Framework of the proposed synthetic defect image generation pipeline
+Expanding upon established approaches that model object
+location and appearance as learnable conditional probability
+distributions for semantically coherent image synthesis (Lee
+et al., 2018), we propose a Context-aware Mask Generation
+(CAMG) module. The proposed CAMG module models the
+defect context as an explicit conditional probability distri-
+bution, enabling both fully automated mask generation and
+disentangled representation of defect context. We deﬁne this
+process as:
+C(I) = P(L, T , S|(I))
+(1)
+where C is the entire CAMG module, I is an input image,
+and L, T , S represent the location, type, and size of poten-
+tial defects respectively. (I) is a set of patch features
+obtained from a frozen vision foundation model. The loca-
+tion L is given as prior in (I), and T , S are the result
+of two patch-wise prediction heads. Various paradigms of
+vision foundation models can be used for , such as con-
+trastive language-image grounding (Radford et al., 2021),
+masking (He et al., 2021), segmentation (Kirillov et al.,
+2023), and self-distillation (Oquab et al., 2024). The class
+head and the size head are linear layers that output defect
+class probabilities pi and size parameters of bounding boxes
+ˆsi = ( ˆwi, ˆhi). They can be jointly trained by a shared linear
+layer. We explicitly designed the process to provide box-
+level guidance rather than pixel-level segmentation masks.
+Our approach reﬂects the practical constraints of manufac-
+turing environments, where acquiring pixel-level annotations
+is labor-intensive and bounding box annotations are predom-
+inant (Caruso et al., 2026). In addition, a non-defective patch
+is classiﬁed as a ‘no defect’ type in the classiﬁcation head
+to guide the model to learn to focus exclusively on the fore-
+ground area of the product image.
+In the training stage, the foundation model is frozen, and
+two prediction heads are jointly trained with patch features
+by minimizing a total loss LC AMG, which is a weighted sum
+of a classiﬁcation loss Lcls and size regression loss Lbox:
+Lcls = −
+
+i
+K+1
+
+k=1
+yi,k log pi,k
+(2)
+Lbox = || log(wi) −log( ˆwi)||2
+2 + || log(hi) −log(ˆhi)||2
+2
+(3)
+LC AMG = Lcls + λLbox
+(4)
+Since the defects occur in a local area, using all patch fea-
+tures leads to severe data imbalance problem. Therefore, we
+use random patch sampling, sampling one positive patch per
+each defect bounding box instance and three negative patches
+from randomly selected non-defective areas. This ratio was
+determined based on the product composition of the dataset.
+Datasets with extensive backgrounds require a higher nega-
+tive ratio to capture normal feature variance, whereas tightly
+123
+
+
+===== PAGE 5 =====
+Journal of Intelligent Manufacturing
+cropped images require a lower ratio. Also, we set λ = 1,
+and the size loss is only deﬁned on positive patches.
+In the inference stage, all patch features are fed into
+the heads to produce a dense defect probability map M ∈
+R(c+2)×H′×W ′, where c is the number of defect classes
+and H′, W ′ are (⌊H/patch size⌋, ⌊W/patch size⌋). Then, a
+binary mask B can be sampled for each defect class using top-
+k sampling. We use k=5, and this random sampling enhances
+the diversity of defect images. Then, the image I and mask
+B are given as input conditions of the following inpainting
+diffusion model.
+Fine-Tuning Inpainting Diffusion Model
+Inpainting Diffusion Process
+We adopt the Latent Diffusion Model (LDM) (Rombach
+et al., 2022) as our generative backbone. Speciﬁcally, we
+employ an inpainting diffusion model that synthesizes only
+masked regions based on the given image. Given an input
+image I, a binary defect mask B and a defect prompt P, the
+input image is ﬁrst encoded into a latent representation using
+a variational autoencoder (VAE). During the denoising pro-
+cess, the U-Net ϵθ predicts the noise component ϵ from the
+noisy latent xt at each denoising timestamp t. In addition,
+after each denoising process, the latent representation corre-
+sponding to the unmasked region (1 −B) is overwritten to
+preserve the background area.
+Fine-Tuning Strategy
+We propose three main strategies to ﬁne-tune the inpainting
+diffusion model. First, LoRA layers are added to ﬁne-tune the
+text encoder and U-Net with a small number of parameters.
+LoRA layers include two learnable low-rank matrices A and
+B that approximate the original layer W0 by
+W0x + W x = W0x + α
+r B Ax
+(5)
+where W0 is the original frozen layer, r is the rank and α
+is a scaling parameter. These parameters learn the domain-
+speciﬁc visual features, which is not learned in the pre-
+training stage. Second, new learnable text tokens are added to
+learn new concepts. Text tokens separate the concepts of dif-
+ferenttypesofdefects,andthemodelcandistinguishbetween
+different defect types. We assign one special token for each
+type of defect, and use pre-trained natural language tokens
+for product names. Third, we adopt two mean squared losses,
+defect loss Ldef and reconstruction loss Lrec. Both losses are
+deﬁned as the differences in the latent space. Defect loss leads
+the model to inpaint the mask area with defects, while recon-
+struction loss restricts the model to maintain the structural
+context of the product. With a randomly selected timestep t,
+the total loss Ltot is the sum of two losses, and the weight λ
+controls the balance between two losses. We used λ = 0.1
+in our case study. The losses are deﬁned as follows:
+Ldef = Ext,ϵ,t
+
+B ⊙||ϵ −ϵθ(xt,B, t, τ(P))||2
+2
+
+(6)
+Lrec = Ext,ϵ,t
+
+B′ ⊙||ϵ −ϵθ(xt,B′, t, τ(P′))||2
+2
+
+(7)
+Ltot = Ldef + λLrec
+(8)
+where I is an input image, B and B′ are defect masks, P and
+P′ are text prompts, and τ is a text encoder. We randomly
+sample an additional bounding box mask of a non-defect
+region M′ with non-defect prompt P′. Text prompts are set
+as P=’a photo of a [product name] with [defect type]’ and
+P′=’a photo of a [product name]’. P and P′ are similar
+except for a special defect token, which allows the defect
+tokens to focus on the distinctive visual feature of the defects.
+Synthetic Defect Image Generation
+With the given product image and defect masks, the inpaint-
+ingdiffusionmodelgeneratessyntheticdefectimagesthrough
+an iterative denoising process. In addition, diffusion mod-
+els are known to occasionally produce undesirable outputs
+because of the nature of their probabilistic generation pro-
+cess (Choi et al., 2025; Garcia-Perez et al., 2025). The types
+of undesirable outputs can be divided into three cases: Nor-
+mal reconstruction, unrealistic defect, and non-conforming
+mask generation. While the non-conforming mask gener-
+ation is minimized by the CAMG module, the other two
+cases can misguide the defect detector. Therefore, we intro-
+duce a conﬁdence-based ﬁltering method to achieve a fully
+automated generation pipeline. We employ a defect detec-
+tor trained on real images to evaluate the generated images.
+Then, we rank the synthetic defect instances based on their
+detection conﬁdence scores and ﬁlter out the bottom k%.
+Experimental Results
+Thissectionexplainsthedatasetusedinthecasestudyandthe
+following experimental results. The experiments were con-
+ducted using Intel(R) Xeon(R) CPU, NVIDIA A100 GPU,
+64GB RAM, Python 3.12, and PyTorch 2.8.0. The inference
+speed was measured on an edge equipment using Intel(R)
+Xeon(R) CPU, NVIDIA RTX 3070 GPU, 32GB RAM,
+Python 3.11 and PyTorch 2.8.0.
+Dataset Description
+The case study was conducted with two industrial sur-
+face defect image datasets. First, the footwear defect image
+123
+
+
+===== PAGE 6 =====
+Journal of Intelligent Manufacturing
+dataset (Cho et al., 2026) is a defect detection dataset col-
+lected from an actual manufacturing line of a footwear
+manufacturing site, including 2,916 defective images and
+476 non-defective images captured from four different view-
+points. Eight different types of products are included in the
+dataset, and ﬁve types of surface defects were annotated in
+the bounding box format. Second, the printed circuit board
+(PCB) defect image dataset (Huang & Wei, 2019) includes
+8,534 images for training and 1,066 for validation with six
+types of surface defects, which were collected from 12 differ-
+ent types of PCB products. To simulate the low-data scenario,
+we used only 10% of the training images randomly. In addi-
+tion, we added 799 non-defective images to use for the
+generation process by cropping non-defective areas in the
+product. Both products share common properties of com-
+plex structures and local surface defects. The input images
+are given in cropped image patches, and the shapes of image
+patches are 512 × 512 and 600 × 600 pixels respectively.
+Visualizations of defect types are provided in Fig. 3.
+Validation of CAMG Module for Learnable Defect
+Context Modeling
+The experimental result in Table 1 shows the performance of
+various pretrained vision foundation model features for the
+backbone of the CAMG module in the footwear dataset. An
+Adam optimizer with the learning rate of 1e-4 was used, and
+the training process iterated for maximum 10 epochs using
+batch size 32. The result shows that DINOv2 features outper-
+form the other state-of-the-art foundation models with a large
+margin. We attribute this superiority to the self-distillation
+trainingobjectiveofDINO,whichprovidespart-levelseman-
+tic understanding. In contrast, MAE focuses on pixel-level
+reconstruction, resulting in missing high-level semantics.
+SigLIP and SAM prioritize global image-text alignment and
+geometric segmentation, which lead to lower discriminative
+capabilities. In addition, leveraging the emergent properties
+of DINO features provides robustness under stylistic varia-
+tions, such as colors, materials, and structures (Caron et al.,
+2021).
+Defect probability maps produced by CAMG module
+using a DINOv2 backbone are presented class-by-class in
+Fig. 4. In case of footwear products, two results are shown
+to demonstrate the robustness over diverse viewpoints. The
+ﬁgure shows how CAMG module can provide contextually
+valid defect masks. For example, in the footwear product
+image, ’High Cement’ and ’Bottom Contamination’ defects
+only occur around the rubber sole area, and ‘Upper Con-
+tamination’ and ’Loose Thread End’ defects occur on the
+upper area of the product. Note that ’Wrinkle’ defect is rarely
+present in the defect probability map, since the wrinkle defect
+is mainly observed on the rear side of the product. Further-
+more, the probability map correctly divides the product area
+andbackgroundarea,whichisrelatedtotheobject-awareness
+of DINO features (Oquab et al., 2024). In the PCB product
+image, while ’Spur’ defect occurs across the product, ’Miss-
+ingHole’onlyoccursonthesolderingarea.Theseprobability
+maps show that the CAMG module effectively models the
+context of defects without using any explicit prior.
+Synthetic Defect Image Generation
+Generation Process
+Weﬁne-tunedapre-trainedinpaintingdiffusionmodel(Rom-
+bach et al., 2022). LoRA layers were added to the attention
+projection layers and output projection layers of U-Net and
+text encoder with parameters of r = 8, α = 16. A total
+of 46 million learnable parameters were ﬁne-tuned for 10
+epochs using a batch size of 32. All modules were trained
+with an Adam optimizer, with the learning rate of 1e-4 for
+U-Netand5e-5fortextencoder.Thesehyperparameterswere
+selected following previous studies (Song et al., 2025). The
+size of negative masks were randomly selected between the
+ﬁrst and third quartile of the bounding box size distribution
+of each dataset. The ﬁne-tuning process took 7 to 9 hours. In
+the generation stage, we randomly selected one defect patch
+for each defect type using top-k sampling. Defect images
+were generated by iterating 50 denoising steps. A negative
+prompt ’blurry, low quality, deformed, ugly, watermark, sig-
+nature, text, logo’ was given together to prevent the model
+from generating unwanted artifacts. The generation process
+took 4 seconds per image under the given setting. A total of
+1,931 and 829 defect images were generated in the footwear
+and PCB dataset respectively.
+Generation Quality Evaluation
+We employ four quality metrics for the evaluation of
+generated images, Foreground Structural Similarity Index
+Measure (Foreground SSIM), Fréchet Inception Distance
+(FID) (Heusel et al., 2018), Learned Perceptual Image
+Patch Similarity (LPIPS) (Zhang et al., 2018) and pseudo
+recall. Foreground SSIM computes the structural similar-
+ity between the original and generated images within the
+mask region, directly assessing how seamlessly the gen-
+erated defect blends with its background. A higher SSIM
+value indicates that the generative model successfully pre-
+serves and reﬂects the structural context. FID and LPIPS are
+utilized to evaluate the visual ﬁdelity and diversity of the
+generated samples at the distribution level. The FID score is
+low when the distribution of the synthetic images is closer
+to that of the real defect images. Conversely, LPIPS mea-
+sures the perceptual variance of the generated images. While
+a higher LPIPS score is conventionally favored in general
+image synthesis to demonstrate high diversity, an excessively
+123
+
+
+===== PAGE 7 =====
+Journal of Intelligent Manufacturing
+Fig. 3 Defect types in two industrial defect detection datasets. (a) Footwear defect image dataset. (b) PCB defect image dataset
+Table 1 Experimental results of
+patch-wise classiﬁcation and
+size regression with vision
+foundation models in the
+CAMG module
+Foundation Model 
+Feature Dim. d
+Classiﬁcation Loss Lcls
+Size Loss Lbox
+DINOv2 (Oquab et al., 2024)
+768
+0.293
+0.007
+SigLIP (Zhai et al., 2023)
+1152
+0.431
+0.013
+MAE (He et al., 2021)
+768
+0.780
+0.009
+SAM (Kirillov et al., 2023)
+256
+0.493
+0.008
+Fig. 4 Defect probability maps produced on non-defective product images. (a) Footwear dataset. (b) PCB dataset
+high LPIPS score often indicates the generation of unrealis-
+tic over-exaggerated defects. Therefore, we prefer an LPIPS
+score that closely approximates the intrinsic perceptual vari-
+ance of the real dataset. Pseudo recall measures the degree
+of alignment between the synthetic defect images and the
+behavior of a reference detector trained exclusively on real
+data. Speciﬁcally, it is computed as the recall of the refer-
+ence detector on the generated images, which is motivated
+by the TRTS (train on real, test on synthetic) evaluation
+paradigm (Esteban et al., 2017). A substantially low pseudo
+recallsuggeststhatthegenerateddefectsdeviatesigniﬁcantly
+from learnable defect patterns, which introduce noise into the
+training process.
+123
+
+
+===== PAGE 8 =====
+Journal of Intelligent Manufacturing
+The evaluation results are shown in Table 2. Random
+in the table indicates random sampling for mask gener-
+ation, and CutPaste indicates crop and paste method (Li
+et al., 2021). Foreground indicates GrabCut (Rother et al.,
+2004) foreground extraction algorithm, which is suggested
+in AnoGen (Gui et al., 2025) pipeline. DeepFillv2 is a GAN-
+based inpainting method (Yu et al., 2019) implemented for
+the comparison. The results clearly show how incorporat-
+ing the CAMG and diffusion model improves the quality of
+synthetic defect images. Our method outperformed the base-
+line methods, with the highest foreground SSIM, the lowest
+FID, and the lowest LPIPS difference compared to the real
+defect images. Notably, both random and foreground sam-
+pling mask generation methods paired with diffusion model
+yield competitive FID and LPIPS scores, yet their pseudo
+recall remains marginally lower than that of our method
+across both datasets. This discrepancy suggests that the syn-
+thesized defects fail to align with the defect patterns when
+defect masks are not positioned in contextually appropriate
+regions. Foreground SSIM scores are measured only within
+our mask generation method to fairly compare the inpainting
+capabilities of generation methods.
+For the qualitative evaluation, sample synthetic defect
+images of all defect types in each dataset are shown in Fig. 5.
+Results in the ﬁgure demonstrates that the synthetic defect
+images exhibit high ﬁdelity, while differentiating the distinct
+visual features of each defect type using text prompts. In
+addition, a comparison between GAN-based method is pro-
+vided in Fig. 6. Red box regions in the ﬁgure reveals that the
+GAN-based method has limitations in fully reproducing the
+texture of the real image data. Furthermore, the ﬁgure also
+demonstrates that despite being trained to generate defect
+data, the model lacks sufﬁcient representational capability to
+synthesize localized defects.
+Failure Cases and Conﬁdence-based Filtering
+Three types of failure cases are illustrated in Fig. 7. Original
+imagesandthreetypesoffailurecases,(a)normalreconstruc-
+tion, (b) unrealistic defects, and (c) non-conforming masks
+are shown in the ﬁgure. To exclude low-quality images such
+as those in the ﬁgure, we used a ﬁltering ratio k = 25% based
+on experiments to balance between the diversity and quality
+of synthetic defect images. A YOLO11 model trained with
+real images was used for ﬁltering.
+Defect Detection with Synthetic Defect Images
+To evaluate the efﬁcacy of synthetic defect images, we
+measured the change in the performance on the defect
+detection models when these images were included in the
+training dataset. Three recent versions of You Only Look
+Once (YOLO) network architectures (Redmon et al., 2016),
+YOLOv8, YOLOv9, and YOLO11 (Jocher & Qiu, 2024;
+Jocher et al., 2023; Wang et al., 2024), and two Detection
+Transformer (DETR) architectures (Zhao et al., 2024) with
+Vision Transformer (ViT) backbone and Resnet50 backbone
+were tested in the experiment. These object detection models
+are widely employed for industrial defect detection (Hus-
+sain, 2023), showing cutting-edge performance at real-time
+inference speeds. Experiments were conducted under two
+manufacturing scenarios: The In-Distribution (ID) case and
+the New Product Introduction (NPI) case. Fig. 8 conceptu-
+ally illustrates the data split and generation ﬂow for both the
+ID and NPI scenarios. To construct the two scenarios from
+a shared dataset, a subset of products was ﬁrst randomly
+designated as unseen products and withheld from the train-
+ing by a product-wise split. The remaining products formed
+the common training set used in both scenarios. In the ID
+case, the unseen products are excluded, and we used 85% of
+randomly selected retained images for training and the other
+15% for validation. In the NPI case, the training set is equiva-
+lent, while the validation set is replaced with images from the
+withheld unseen products. Speciﬁcally, 6 out of 8 products
+for footwear and 9 out of 12 products for PCB were used for
+training, and the remaining products were used for validation.
+Note that a small set of normal images for unseen prod-
+ucts is assumed to be accessible in advance, which reﬂects
+a practical NPI scenario where sample product images can
+be collected before defects are observed. An IoU threshold
+of 0.25 and a conﬁdence threshold of 0.25 were applied for
+precision and recall measure.
+All object detectors were trained under same setting
+for fair comparison. The scale parameter is ’small’ for
+YOLO-based models, considering the number of patch-wise
+inferences required in the deployment stage (Akyon et al.,
+2022; Cho et al., 2026). Models were trained for 100 epochs
+using an AdamW optimizer with 1e-4 learning rate, and
+with batch size 8. In addition, HSV augmentations, random
+ﬂip, random rotation were applied on the training images
+for better generalization. Mean average precision (mAP50),
+precision, and recall metrics presented on this section are
+averaged across all classes. Additional class-wise experi-
+mental results are reported in Appendix Appendix A. All
+performance gains are expressed in percentage points (pp).
+In-Distribution Case
+The experimental results in the ID case are shown in
+Table 3. The results show that object detection models
+clearly beneﬁt from using the synthetic defect images. All
+models achieved higher mean average precision at IoU 0.5
+(mAP50), precision, and recall scores when trained with syn-
+thetic defect images in both footwear and PCB dataset. The
+improvements of mAP50 ranged from 0.8 pp to 7.3 pp in the
+footwear dataset, and 5.7 pp to 10.6 pp in the PCB dataset.
+123
+
+
+===== PAGE 9 =====
+Journal of Intelligent Manufacturing
+Table 2 Synthetic defect image generation quality metrics
+Dataset
+Methods
+Foreground SSIM(↑)
+FID(↓)
+LPIPS
+Pseudo Recall(%)
+Footwear
+Random+CutPaste (Li et al., 2021)
+-
+68.60
+0.741
+25.7
+Random+Diffusion
+-
+26.77
+0.735
+24.0
+Foreground+Diffusion (Gui et al., 2025)
+-
+27.15
+0.712
+37.2
+CAMG+CutPaste
+0.501
+68.59
+0.724
+31.8
+CAMG+DeepFillv2 (Yu et al., 2019)
+0.563
+28.01
+0.709
+26.4
+CAMG+Diffusion(Ours)
+0.739
+26.27
+0.709
+63.4
+Real Data
+-
+-
+0.687
+68.9
+PCB
+Random+CutPaste
+-
+201.35
+0.515
+38.0
+Random+Diffusion
+-
+45.06
+0.488
+36.9
+Foreground+Diffusion
+-
+43.30
+0.491
+30.7
+CAMG+CutPaste
+0.615
+50.15
+0.502
+46.1
+CAMG+DeepFillv2
+0.766
+43.54
+0.494
+13.4
+CAMG+Diffusion(Ours)
+0.885
+42.72
+0.493
+75.7
+Real Data
+-
+-
+0.479
+61.2
+Table 3 Experimental results in the In-distribution case setup. R: Real data, R+S: Real and synthetic data
+Dataset
+Model
+Data
+mAP50 (%)
+Precision (%)
+Recall (%)
+GFLOPS
+FPS
+Footwear
+YOLOv8
+R
+55.3
+79.3
+71.3
+28.4
+116
+R+S
+56.1
+83.9
+72.1
+YOLOv9
+R
+56.2
+78.2
+69.2
+26.7
+128
+R+S
+57.2
+82.9
+71.9
+YOLO11
+R
+47.2
+74.5
+68.9
+21.5
+131
+R+S
+51.0
+82.2
+71.5
+RT-DETR-ViT-L
+R
+54.7
+73.4
+68.2
+103.5
+45
+R+S
+60.5
+79.2
+78.5
+RT-DETR-Resnet50
+R
+48.9
+66.0
+64.5
+125.6
+44
+R+S
+56.2
+75.1
+73.6
+PCB
+YOLOv8
+R
+54.8
+65.0
+63.2
+28.4
+116
+R+S
+60.5
+65.7
+71.4
+YOLOv9
+R
+62.0
+69.8
+74.2
+26.7
+128
+R+S
+70.6
+71.5
+81.1
+YOLO11
+R
+53.5
+62.3
+61.2
+21.5
+131
+R+S
+61.9
+69.4
+68.0
+RT-DETR-ViT-L
+R
+52.4
+61.7
+66.1
+103.5
+45
+R+S
+63.0
+70.4
+77.5
+RT-DETR-Resnet50
+R
+55.6
+56.7
+61.0
+125.6
+44
+R+S
+65.0
+66.7
+71.7
+Precision improvements made by the synthetic dataset were
+up to 9.9 pp and 10.0 pp respectively, and recall improve-
+ments were up to 10.3 pp and 11.4 pp. The best results in each
+dataset are marked in bold. RT-DETR with ViT-L backbone
+achieved the highest performance in the footwear dataset,
+while YOLOv9 showed the best results in the PCB dataset.
+Regardless of the speciﬁc architecture, consistent perfor-
+mance gains across all models conﬁrm that using synthetic
+defect images is a robust strategy for enhancing defect detec-
+tion accuracy. These results demonstrate that the synergy
+between optimal model selection and synthetic data gener-
+ation is the key to achieving state-of-the-art performance in
+industrial defect detection.
+123
+
+
+===== PAGE 10 =====
+Journal of Intelligent Manufacturing
+Fig. 5 Synthetic defect images
+Table 4 Comparison of defect detection performance between synthetic defect image generation methods. R: Real data, R+S: Real and synthetic
+data
+Dataset
+Data
+Method
+mAP50 (%)
+Precision (%)
+Recall (%)
+Footwear
+R
+-
+47.2
+74.5
+68.9
+R+S
+Random+Diffusion
+47.0
+72.6
+63.5
+Foreground+Diffusion (Gui et al., 2025)
+42.1
+67.7
+62.8
+CAMG+DeepFillv2 (Yu et al., 2019)
+46.1
+65.8
+64.5
+Ours
+51.0
+82.2
+71.5
+PCB
+R
+-
+53.5
+62.3
+61.2
+R+S
+Random+Diffusion
+50.6
+58.0
+60.2
+Foreground+Diffusion
+49.2
+57.9
+56.2
+CAMG+DeepFillv2
+56.1
+64.7
+65.1
+Ours
+61.9
+69.4
+68.0
+Table 4 compares the defect detection performance of the
+YOLO11 model when trained on real images combined with
+synthetic image sets generated by different methods. The
+experimental results demonstrate that our proposed pipeline
+achieved the highest performance improvements across both
+datasets, recording signiﬁcant mAP gains of 3.8 pp and
+8.4 pp over real-only baselines in the footwear and PCB
+datasets, respectively. Conversely, incorporating synthetic
+defect images from the other baseline methods actually
+degraded the detection performance in the footwear dataset,
+leading to lower overall metrics. These differences highlight
+the importance of two factors that are required to effectively
+utilize synthetic data for industrial datasets with complex sur-
+faces, a generative model capable of producing high-ﬁdelity
+textures, and a mask generation process that comprehends
+domain context to accurately specify defect characteristics.
+Table 5 presents the performance variance of the YOLO11
+model in the ID case across different synthetic defect image
+123
+
+
+===== PAGE 11 =====
+Journal of Intelligent Manufacturing
+Fig. 6 Synthetic defect images
+generated by GAN-based and
+diffusion-based inpainting
+methods
+Table 5 Experimental results in
+the In-distribution case setup
+with different synthetic image
+ﬁltering ratio. R: Real data,
+R+S: Real and synthetic data
+Dataset
+Data
+Filtering Ratio k (%)
+# of Images
+mAP50 (%)
+Precision (%)
+Recall (%)
+Footwear
+R
+-
+2,479
+47.2
+74.5
+68.9
+R+S
+0
+4,410
+47.9
+84.8
+67.0
+R+S
+25
+3,927
+51.0
+82.2
+71.5
+R+S
+50
+3,444
+50.1
+81.1
+72.9
+PCB
+R
+-
+853
+53.5
+62.3
+61.2
+R+S
+0
+1,682
+63.0
+69.1
+63.8
+R+S
+25
+1,474
+61.9
+69.4
+68.0
+R+S
+50
+1,268
+62.3
+68.3
+70.1
+123
+
+
+===== PAGE 12 =====
+Journal of Intelligent Manufacturing
+Fig. 7 Three types of failure
+cases. (a) Normal
+reconstruction. (b) Unrealistic
+defect. (c) Non-conforming
+mask generation
+Fig. 8 Conceptual illustration of two experimental settings
+Fig. 9 Comparison of defect detection results between YOLO11 models in NPI case trained with and without synthetic defect images
+123
+
+
+===== PAGE 13 =====
+Journal of Intelligent Manufacturing
+Table 6 Experimental results in
+the NPI case setup. R: Real data,
+R+S: Real and synthetic data
+Dataset
+Model
+Data
+mAP50 (%)
+Precision (%)
+Recall (%)
+GFLOPS
+FPS
+Footwear
+YOLOv8
+R
+37.3
+58.0
+45.2
+28.4
+116
+R+S
+40.5
+66.0
+55.6
+YOLOv9
+R
+37.4
+59.8
+45.8
+26.7
+128
+R+S
+43.1
+67.7
+58.7
+YOLO11
+R
+36.6
+58.1
+41.0
+21.5
+131
+R+S
+42.0
+71.0
+59.3
+RT-DETR-ViT-L
+R
+42.4
+65.4
+48.4
+103.5
+45
+R+S
+46.0
+73.9
+58.0
+PCB
+YOLOv8
+R
+40.0
+58.9
+58.1
+28.4
+116
+R+S
+56.4
+64.7
+69.3
+YOLOv9
+R
+38.4
+53.0
+48.5
+26.7
+128
+R+S
+57.6
+66.2
+70.0
+YOLO11
+R
+34.2
+52.3
+52.3
+21.5
+131
+R+S
+54.3
+66.0
+65.8
+RT-DETR-ViT-L
+R
+45.6
+58.1
+65.0
+103.5
+45
+R+S
+61.1
+69.0
+75.6
+Fig. 10 t-SNE visualization of feature distributions extracted from YOLO11 backbone. (a) Low-level feature distribution. (b) Deep feature distri-
+bution
+ﬁltering ratio k. A trade-off between precision and recall
+is observable in both datasets. A lower k tends to increase
+precision but decrease recall, whereas applying higher k
+improves recall at the expense of precision. In addition, the
+highest mAP50 in the PCB dataset was achieved without
+any ﬁltering. This result is related to the difﬁculty of defect
+image generation. Since the PCB dataset features relatively
+monotonic defect patterns, the generative model inherently
+produces reliable synthetic images, thereby reducing the
+necessity of the ﬁltering process.
+123
+
+
+===== PAGE 14 =====
+Journal of Intelligent Manufacturing
+Table 7 Detailed Experimental
+Results on Footwear Dataset.
+HC-High Cement, UC-Upper
+Contamination, BC-Bottom
+Contamination, LTE-Loose
+Thread End, WR-Wrinkle
+Setup
+Model
+Data
+mAP50 (%)
+Class-wise mAP50 (%)
+HC
+UC
+BC
+LTE
+WR
+ID
+YOLOv8
+R
+55.3
+60.1
+59.6
+50.0
+53.8
+52.9
+R+S
+56.1
+63.4
+65.7
+55.3
+54.5
+41.5
+YOLOv9
+R
+56.2
+60.2
+50.8
+57.9
+56.5
+55.7
+R+S
+57.2
+58.1
+54.8
+52.8
+57.1
+63.0
+YOLO11
+R
+47.2
+54.9
+52.4
+45.7
+42.0
+40.9
+R+S
+51.0
+60.7
+53.4
+53.3
+47.7
+39.9
+RT-DETR-ViT-L
+R
+54.7
+46.9
+32.2
+62.6
+57.1
+69.8
+R+S
+60.5
+52.6
+50.7
+65.4
+63.4
+70.6
+RT-DETR-Resnet50
+R
+48.9
+38.6
+52.5
+49.0
+46.6
+57.7
+R+S
+56.2
+45.3
+56.9
+59.5
+58.8
+60.5
+NPI
+YOLOv8
+R
+37.3
+30.6
+35.2
+52.0
+29.5
+39.0
+R+S
+42.0
+36.9
+36.9
+53.4
+32.8
+50.0
+YOLOv9
+R
+37.4
+37.8
+30.4
+50.8
+27.2
+41.0
+R+S
+43.1
+38.7
+34.1
+55.5
+32.7
+54.7
+YOLO11
+R
+36.6
+23.7
+33.4
+45.6
+35.1
+45.3
+R+S
+42.0
+31.3
+36.8
+48.0
+38.4
+55.6
+RT-DETR-ViT-L
+R
+42.4
+35.5
+30.7
+59.9
+53.7
+32.0
+R+S
+46.0
+38.8
+36.0
+61.8
+58.0
+35.5
+NPI Case
+In the NPI case setup, the defect detection models were
+trained with additional synthetic defect images that are made
+using the non-defective product images of unseen products.
+Experimental results are reported in Table 6.
+As presented in Table 6, the baseline models suffer from
+severe performance degradation in the NPI scenario due to
+the distribution shift between existing and unseen products
+compared to the performance metrics in Table 3. The results
+show that incorporating the synthetic defect images signif-
+icantly mitigates this performance lag across all models,
+resulting in higher mAP score by up to 5.7 percentage points
+in the footwear dataset and 20.1 percentage points in the PCB
+dataset. Improvements in precision and recall scores were up
+to 12.9 pp, 18.3 pp in the footwear dataset, and 13.7 pp, 21.5
+pp in the PCB dataset. The overall performance gain was
+higher in the PCB dataset. This difference comes from dif-
+ferent structural characteristics of the dataset. PCB images
+feature more rigid structure with consistent spatial align-
+ment,whichallowsmoreeffectivefeaturespaceinterpolation
+between different products. Lightweight models trained with
+synthetic data achieved comparable or superior performance
+to the computationally expensive models trained solely on
+real images. This indicates that a data-centric approach is
+particularly effective than a model-centric approach in NPI
+scenarios.
+Discussion
+Inthissection,weprovideaqualitativeanalysisandafeature-
+level visualization to explore how the proposed synthetic data
+generation enhances defect detection performance. Fig. 9
+shows different inference results of YOLO11 models trained
+with and without synthetic defect images. The model trained
+without synthetic defect image does not capture the defects
+on unseen products. However, the model trained with syn-
+thetic data successfully captures the defect and correctly
+classiﬁes the defect types.
+Fig. 10 reveals how the synthetic data contributes to the
+signiﬁcant performance improvements in the NPI case. The
+ﬁgure illustrates the feature distributions of footwear defect
+images extracted from the backbone of the YOLO11s model
+trained on real images. Low-level features in (a) and deep fea-
+tures in (b) correspond to the outputs of the ﬁrst and the last
+convolutional blocks, respectively. In the low-level feature
+space, a distinct separation between the train and valida-
+tion image clusters reﬂects the visual appearance differences
+between products. This discrepancy indicates a distribution
+shift, which is a primary factor contributing to the perfor-
+mance degradation. Conversely, in the deep feature space,
+the training and validation image features are mixed. This
+overlap suggests that the intrinsic characteristics required
+for defect detection remain consistent. The synthetic defect
+images span across both the training and validation clusters
+in the low-level space, indicating that the generated images
+capture the visual traits of the new product. In addition,
+123
+
+
+===== PAGE 15 =====
+Journal of Intelligent Manufacturing
+Table 8 Detailed Experimental
+Results on PCB Dataset.
+MB-Mouse Bite, SP-Spur,
+MH-Missing Hole, SH-Short,
+OC-Open Circuit, SC-Spurious
+Copper
+Setup
+Model
+Data
+mAP50 (%)
+Class-wise mAP50 (%)
+MB
+SP
+MH
+SH
+OC
+SC
+ID
+YOLOv8
+R
+54.8
+54.6
+44.7
+53.0
+58.1
+61.6
+57.0
+R+S
+56.1
+57.1
+54.9
+63.4
+70.6
+58.7
+58.3
+YOLOv9
+R
+56.2
+63.2
+58.3
+49.4
+69.6
+66.0
+65.5
+R+S
+57.2
+69.6
+66.5
+68.0
+74.8
+68.5
+76.3
+YOLO11
+R
+53.5
+57.1
+43.1
+50.7
+56.5
+57.9
+55.7
+R+S
+61.9
+59.4
+54.5
+62.3
+68.9
+65.3
+60.7
+RT-DETR-ViT-L
+R
+52.4
+57.6
+55.7
+53.4
+51.4
+45.0
+51.2
+R+S
+63.0
+71.1
+64.7
+69.3
+63.4
+53.3
+56.4
+RT-DETR-Resnet50
+R
+55.6
+59.2
+49.8
+59.2
+51.5
+52.3
+61.6
+R+S
+65.0
+65.7
+67.4
+67.2
+66.6
+59.0
+64.3
+NPI
+YOLOv8
+R
+40.0
+49.4
+26.2
+28.4
+50.1
+40.0
+45.8
+R+S
+56.4
+55.2
+39.7
+65.1
+60.8
+47.8
+69.9
+YOLOv9
+R
+38.4
+44.0
+23.5
+36.2
+47.6
+32.0
+47.2
+R+S
+57.6
+53.6
+44.0
+66.8
+62.2
+49.0
+70.2
+YOLO11
+R
+34.2
+45.5
+19.7
+35.3
+39.8
+30.2
+34.4
+R+S
+54.3
+56.7
+33.0
+60.5
+65.9
+48.7
+61.0
+RT-DETR-ViT-L
+R
+45.6
+45.8
+53.6
+36.7
+41.5
+43.6
+52.4
+R+S
+61.1
+56.3
+68.6
+62.9
+65.9
+51.3
+61.6
+the synthetic images are uniformly distributed throughout
+the cluster in the deep feature space, conﬁrming that the
+defect-related features of the synthetic data align well with
+the distribution of real defects. These observations explain
+how the synthetic data acts as a bridge between the existing
+and new data distributions and enhances the defect detec-
+tion models. A quantitative analysis using Maximum Mean
+Discrepancy (MMD) below the ﬁgure also conﬁrms that the
+inclusion of synthetic images bridges the distributional gap
+between the training and validation sets.
+Conclusion
+In this paper, we addressed the challenge of defect data
+scarcity in dynamic manufacturing environments by propos-
+ing a fully automated synthetic defect image generation
+pipeline.Theproposedmethodcanbeimmediatelyappliedto
+newly introduced products using only normal images, mak-
+ing it particularly suited for manufacturing settings where
+real defect images are rare and product designs change
+frequently. Experiments across multiple detector architec-
+tures on two real-world industrial datasets conﬁrmed that the
+synthetic images consistently improve defect detection per-
+formance,withthemostsubstantialgainsobservedintheNPI
+scenario. These results suggest that automating the defect
+data generation process is a practical and scalable direction
+for maintaining robust inspection systems under distribution
+shift.
+The limitations of our study and future research oppor-
+tunities are as follows. First, the current method is built on
+an assumption that the defect types are ﬁxed. The generation
+capability of entirely novel defect types is not studied yet,
+and future work could explore few-shot or zero-shot learn-
+ing techniques for CAMG and inpainting diffusion. Second,
+the current study generates synthetic defect images by deter-
+mining the defect’s type, size, and location. This approach
+does not reﬂect other contexts, such as the defect’s orienta-
+tion or severity. Enhancing the controllability of the defect
+image generation model could further increase the diversity
+of the dataset and improve its utility in downstream tasks.
+Detailed Experimental Results
+Table 7 and Table 8 present the experimental results of class-
+wise mAP50 metrics in two datasets. ’ID’ and ’NPI’ setup
+corresponds to the in-distribution and NPI cases. Class names
+written in abbreviations are provided in the caption of each
+table.
+Acknowledgements This research was supported by the Regional
+Innovation System & Education (RISE) program through the Gyeong-
+buk RISE CENTER, funded by the Ministry of Education (MOE) and
+the Gyeongsangbuk-do, Republic of Korea. (2025-RISE-15-118)
+Author Contributions Jaebong Cho contributed to the overall study
+conception, literature review, methodology design, experimental anal-
+ysis, and wrote the original draft. Dohyeon Kong and Jihoon Nam
+assisted with the methodology design, visualization, and revised the
+123
+
+
+===== PAGE 16 =====
+Journal of Intelligent Manufacturing
+manuscript. Hyunbo Cho provided guidance on the conceptual design
+and manuscript writing.
+Declarations
+Competing Interests The authors have no relevant ﬁnancial or non-
+ﬁnancial interests to disclose.
+Open Access This article is licensed under a Creative Commons
+Attribution-NonCommercial-NoDerivatives 4.0 International License,
+which permits any non-commercial use, sharing, distribution and repro-
+duction in any medium or format, as long as you give appropriate credit
+to the original author(s) and the source, provide a link to the Creative
+Commons licence, and indicate if you modiﬁed the licensed mate-
+rial. You do not have permission under this licence to share adapted
+material derived from this article or parts of it. The images or other
+third party material in this article are included in the article’s Creative
+Commons licence, unless indicated otherwise in a credit line to the
+material. If material is not included in the article’s Creative Commons
+licence and your intended use is not permitted by statutory regula-
+tion or exceeds the permitted use, you will need to obtain permission
+directly from the copyright holder. To view a copy of this licence, visit
+http://creativecommons.org/licenses/by-nc-nd/4.0/.
+References
+Akyon, F. C., Altinuc, S. O., & Temizel, A. (2022). Slicing aided hyper
+inference and ﬁne-tuning for small object detection. In 2022 IEEE
+International Conference on Image Processing (ICIP) (pp. 966–
+970).
+Bergmann, P., Fauser, M., Sattlegger, D., & Steger, C. (2019). Mvtec ad
+— a comprehensive real-world dataset for unsupervised anomaly
+detection. In 2019 IEEE/CVF Conference on Computer Vision and
+Pattern Recognition (CVPR) (pp. 9584–9592). https://doi.org/10.
+1109/CVPR.2019.00982
+Caron, M., Touvron, H., Misra, I., Jégou, H., Mairal, J., Bojanowski,
+P., & Joulin, A. (2021). Emerging Properties in Self-Supervised
+Vision Transformers. https://arxiv.org/abs/2104.14294
+Caruso, E., Simoni, A., & Pelosin, F. (2026). Bounding Box-Guided
+Diffusion for Synthesizing Industrial Images and Segmentation
+Map. https://arxiv.org/abs/2505.03623
+Chen,Z.,Cao,S.,Song,T.,&Jiang,Q.(2025).Improvedlatentdiffusion
+model for data augmentation in ﬂat tube defect detection. Jour-
+nal of Intelligent Manufacturing. https://doi.org/10.1007/s10845-
+025-02749-4
+Cho, J., Nam, J., & Cho, H. (2026). Automated footwear surface
+inspection system based on the deep learning object detection. In
+Mizuyama, H., Morinaga, E., Nonaka, T., Kaihara, T., Cieminski,
+G., Romero, D. (eds.) Advances in Production Management
+Systems. Cyber-Physical-Human Production Systems: Human-AI
+Collaboration and Beyond (pp. 341–353). Springer, Cham.
+Choi, J., Kim, M., & Hong, J. (2025). MAGIC: Mask-Guided Diffu-
+sion Inpainting with Multi-Level Perturbations and Context-Aware
+Alignment for Few-Shot Anomaly Generation. https://arxiv.org/
+abs/2507.02314
+de Giorgio, A., Cola, G., & Wang, L. (2023). Systematic review of class
+imbalance problems in manufacturing. Journal of Manufacturing
+Systems, 71, 620–644. https://doi.org/10.1016/j.jmsy.2023.10.014
+Esteban, C., Hyland, S. L., & Rätsch, G. (2017). Real-valued (Medical)
+Time Series Generation with Recurrent Conditional GANs. https://
+arxiv.org/abs/1706.02633
+Gal, R., Alaluf, Y., Atzmon, Y., Patashnik, O., Bermano, A. H., Chechik,
+G., & Cohen-or, D. (2023). An image is worth one word: Person-
+alizing text-to-image generation using textual inversion. In The
+Eleventh International Conference on Learning Representations.
+https://openreview.net/forum?id=NAQvF08TcyG
+Ganin, Y., Ustinova, E., Ajakan, H., Germain, P., Larochelle, H.,
+Laviolette, F., Marchand, M., & Lempitsky, V. (2016). Domain-
+Adversarial Training of Neural Networks. https://arxiv.org/abs/
+1505.07818
+Garcia-Perez, A., Gomez-Silva, M. J., & Escalera-Hueso, A. (2025). A
+generative ai approach to improve in-situ vision tool wear monitor-
+ing with scarce data. Journal of Intelligent Manufacturing, 36(5),
+3165–3183. https://doi.org/10.1007/s10845-024-02379-2
+Gui, G., Gao, B.-B., Liu, J., Wang, C., & Wu, Y. (2025). Few-Shot
+Anomaly-Driven Generation for Anomaly Classiﬁcation and Seg-
+mentation. https://arxiv.org/abs/2505.09263
+He, K., Chen, X., Xie, S., Li, Y., Dollár, P., & Girshick, R. (2021).
+Masked Autoencoders Are Scalable Vision Learners. https://arxiv.
+org/abs/2111.06377
+Heusel, M., Ramsauer, H., Unterthiner, T., Nessler, B., & Hochre-
+iter, S. (2018). GANs Trained by a Two Time-Scale Update Rule
+Converge to a Local Nash Equilibrium. https://arxiv.org/abs/1706.
+08500
+Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L.,
+& Chen, W. (2022). Lora: Low-rank adaptation of large language
+models.In:InternationalConferenceonLearningRepresentations.
+https://openreview.net/forum?id=nZeVKeeFYf9
+Hu, T., Zhang, J., Yi, R., Du, Y., Chen, X., Liu, L., Wang, Y., & Wang, C.
+(2024). AnomalyDiffusion: Few-Shot Anomaly Image Generation
+with Diffusion Model. https://arxiv.org/abs/2312.05767
+Huang, W., & Wei, P. (2019). A PCB Dataset for Defects Detection and
+Classiﬁcation. https://arxiv.org/abs/1901.08204
+Hussain, M. (2023). Yolo-v1 to yolo-v8, the rise of yolo and its com-
+plementary nature toward digital manufacturing and industrial
+defect detection. Machines, 11(7), 677. https://doi.org/10.3390/
+machines11070677
+Jocher, G., & Qiu, J. (2024). Ultralytics YOLO11. https://github.com/
+ultralytics/ultralytics
+Jocher,G.,Chaurasia,A.,&Qiu,J.(2023).UltralyticsYOLOv8.https://
+github.com/ultralytics/ultralytics
+Kirillov, A., Mintun, E., Ravi, N., Mao, H., Rolland, C., Gustafson,
+L., Xiao, T., Whitehead, S., Berg, A. C., Lo, W.-Y., Dollár, P.,
+& Girshick, R. (2023). Segment Anything. https://arxiv.org/abs/
+2304.02643
+Lee, D., Liu, S., Gu, J., Liu, M.-Y., Yang, M.-H., & Kautz, J. (2018).
+Context-Aware Synthesis and Placement of Object Instances.
+https://arxiv.org/abs/1812.02350
+Lengyel, A., Strafforello, O., Bruintjes, R.-J., Gielisse, A., & Gemert, J.
+(2023). Color Equivariant Convolutional Networks. https://arxiv.
+org/abs/2310.19368
+Li, C.-L., Sohn, K., Yoon, J., & Pﬁster, T. (2021). CutPaste: Self-
+Supervised Learning for Anomaly Detection and Localization.
+https://arxiv.org/abs/2104.04015
+Li, C., Yan, H., Qian, X., Zhu, S., Zhu, P., Liao, C., Tian, H., Li, X.,
+Wang, X., & Li, X. (2023). A domain adaptation yolov5 model for
+industrial defect inspection. Measurement, 213, Article 112725.
+https://doi.org/10.1016/j.measurement.2023.112725
+Lu, H., Dong, B., Zhu, B., Ma, S., Zhang, Z., Peng, J., & Song, K.
+(2025). A survey on deep learning-based object detection for crop
+monitoring: pest, yield, weed, and growth applications. The Visual
+Computer, 41(12), 10069–10094. https://doi.org/10.1007/s00371-
+025-04022-4
+Ni, X., Ma, Z., Liu, J., Shi, B., & Liu, H. (2022). Attention network for
+rail surface defect detection via consistency of intersection-over-
+union(iou)-guided center-point estimation. IEEE Transactions on
+IndustrialInformatics,18(3),1694–1705.https://doi.org/10.1109/
+TII.2021.3085848
+123
+
+
+===== PAGE 17 =====
+Journal of Intelligent Manufacturing
+Oquab,M.,Darcet,T.,Moutakanni,T.,Vo,H.,Szafraniec,M.,Khalidov,
+V., Fernandez, P., Haziza, D., Massa, F., El-Nouby, A., Assran,
+M., Ballas, N., Galuba, W., Howes, R., Huang, P.-Y., Li, S.-W.,
+Misra, I., Rabbat, M., Sharma, V., Synnaeve, G., Xu, H., Jegou,
+H., Mairal, J., Labatut, P., Joulin, A., & Bojanowski, P. (2024).
+DINOv2: Learning Robust Visual Features without Supervision.
+https://arxiv.org/abs/2304.07193
+Radford, A., Kim, J. W., Hallacy, C., Ramesh, A., Goh, G., Agarwal,
+S., Sastry, G., Askell, A., Mishkin, P., Clark, J., Krueger, G., &
+Sutskever, I. (2021). Learning Transferable Visual Models From
+Natural Language Supervision. https://arxiv.org/abs/2103.00020
+Redmon, J., Divvala, S., Girshick, R., & Farhadi, A. (2016). You only
+look once: Uniﬁed, real-time object detection. In 2016 IEEE Con-
+ference on Computer Vision and Pattern Recognition (CVPR) (pp.
+779–788). https://doi.org/10.1109/CVPR.2016.91
+Rombach, R., Blattmann, A., Lorenz, D., Esser, P., & Ommer, B. (2022).
+High-resolution image synthesis with latent diffusion models. In
+Proceedings of the IEEE/CVF Conference on Computer Vision and
+Pattern Recognition (CVPR) (pp. 10684–10695).
+Rother, C., Kolmogorov, V., & Blake, A. (2004). “grabcut”: Interactive
+foreground extraction using iterated graph cuts. In: ACM SIG-
+GRAPH 2004 Papers. SIGGRAPH ’04 (pp. 309–314). Association
+for Computing Machinery, New York, NY, USA. https://doi.org/
+10.1145/1186562.1015720
+Ruiz, N., Li, Y., Jampani, V., Pritch, Y., Rubinstein, M., & Aberman,
+K. (2022). DreamBooth: Fine Tuning Text-to-image Diffusion
+Models for Subject-Driven Generation. https://arxiv.org/abs/2208.
+12242
+Shen, J.-J., Lee, C.-F., Chen, Y.-C., & Agrawal, S. (2020). Unsuper-
+vised defect detection based on boundary equilibrium generative
+adversarial network. In Proceedings of the 6th International Con-
+ference on Frontiers of Educational Technologies. ICFET ’20 (pp.
+178–182). Association for Computing Machinery, New York, NY,
+USA. https://doi.org/10.1145/3404709.3404765
+Shinde, P. P., Pai, P. P., & Adiga, S. P. (2022). Wafer defect localization
+andclassiﬁcationusingdeeplearningtechniques.IEEEAccess,10,
+39969–39974. https://doi.org/10.1109/ACCESS.2022.3166512
+Song,J.,Park,D.,Baek,K.,Lee,S.,Choi,J.,Kim,E.,&Yoon,S.(2025).
+DefectFill: Realistic Defect Generation with Inpainting Diffusion
+Model for Visual Inspection. https://arxiv.org/abs/2503.13985
+Wang, Z., Wang, P., Liu, K., Wang, P., Fu, Y., Lu, C.-T., Aggarwal, C.
+C., Pei, J., & Zhou, Y. (2025). A Comprehensive Survey on Data
+Augmentation. https://arxiv.org/abs/2405.09591
+Wang, C.-Y., Yeh, I.-H., & Liao, H.-Y. M. (2024). YOLOv9: Learning
+What You Want to Learn Using Programmable Gradient Informa-
+tion. https://arxiv.org/abs/2402.13616
+Wang, J., Lan, C., Liu, C., Ouyang, Y., Qin, T., Lu, W., Chen, Y.,
+Zeng, W., & Yu, P. S. (2023). Generalizing to unseen domains:
+A survey on domain generalization. IEEE Transactions on Knowl-
+edge and Data Engineering, 35(8), 8052–8072. https://doi.org/10.
+1109/TKDE.2022.3178128
+Yao, H., Choi, C., Cao, B., Lee, Y., Koh, P. W., Finn, C. (2023). Wild-
+Time: A Benchmark of in-the-Wild Distribution Shift over Time.
+https://arxiv.org/abs/2211.14238
+Yu, J., Lin, Z., Yang, J., Shen, X., Lu, X., & Huang, T. (2019). Free-
+Form Image Inpainting with Gated Convolution. https://arxiv.org/
+abs/1806.03589
+Zeng, W., Guo, J., Hao, L., & Liu, J. (2025). A novel image generation
+method based on stable diffusion xl turbo and image processing for
+improving the performance of object detection models in industrial
+surface defect detection. The International Journal of Advanced
+Manufacturing Technology. https://doi.org/10.1007/s00170-025-
+16960-3
+Zhai, X., Mustafa, B., Kolesnikov, A., & Beyer, L. (2023). Sigmoid
+LossforLanguageImagePre-Training.https://arxiv.org/abs/2303.
+15343
+Zhang, G., Cui, K., Hung, T.-Y., & Lu, S. (2021). Defect-GAN: High-
+FidelityDefectSynthesisforAutomatedDefectInspection.https://
+arxiv.org/abs/2103.15158
+Zhang, R., Isola, P., Efros, A. A., Shechtman, E., & Wang, O. (2018).
+The Unreasonable Effectiveness of Deep Features as a Perceptual
+Metric. https://arxiv.org/abs/1801.03924
+Zhang, H., Li, S., Miao, Q., Fang, R., Xue, S., Hu, Q., Hu, J., & Chan,
+S. (2024). Surface defect detection of hot rolled steel based on
+multi-scale feature fusion and attention mechanism residual block.
+Scientiﬁc Reports, 14(1), 7671. https://doi.org/10.1038/s41598-
+024-57990-3
+Zhao, Y., Lv, W., Xu, S., Wei, J., Wang, G., Dang, Q., Liu, Y., & Chen,
+J. (2024). DETRs Beat YOLOs on Real-time Object Detection.
+https://arxiv.org/abs/2304.08069
+Zou,Y.,Jeong,J.,Pemula,L.,Zhang,D.,&Dabeer,O.(2022).SPot-the-
+Difference Self-Supervised Pre-training for Anomaly Detection
+and Segmentation. https://arxiv.org/abs/2207.14315
+Publisher’s Note Springer Nature remains neutral with regard to juris-
+dictional claims in published maps and institutional afﬁliations.
+123

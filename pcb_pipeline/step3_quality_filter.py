@@ -161,9 +161,10 @@ class YOLO11DefectTrainer:
                 batch=batch,
                 imgsz=imgsz,
                 optimizer="AdamW",
-                lr0=1e-3,
+                lr0=1e-4,
                 cos_lr=True,
                 device=self.device,
+                workers=2,
                 project=str(self.project),
                 name=name,
                 exist_ok=True,
@@ -534,7 +535,11 @@ class QualityFilter:
 
         for cls_name, records in by_class.items():
             cls_out = Path(output_dir) / "classes" / cls_name
-            acc, rej = self.filter(records, cls_out, copy_accepted=False, data_yaml=None)
+            # copy_accepted=True để ảnh và file nhãn YOLO nằm cạnh nhau trong
+            # classes/<class>/accepted/{images,labels}. Nếu copy=False, YAML
+            # augmented sẽ trỏ tới ảnh gốc nhưng nhãn lại nằm ở thư mục khác,
+            # khiến Ultralytics không tìm thấy label.
+            acc, rej = self.filter(records, cls_out, copy_accepted=True, data_yaml=None)
             all_accepted.extend(acc)
             all_rejected.extend(rej)
             logger.info(f"  [{cls_name:16s}] Keep: {len(acc):3d} | Reject: {len(rej):3d}")
@@ -552,6 +557,92 @@ class QualityFilter:
 
         return all_accepted, all_rejected
 
+    @staticmethod
+    def _split_path_roots(base_yaml: Path, dataset_root: Optional[Path]) -> List[Path]:
+        """Các root dùng để cứu path tương đối từ YAML/list cũ."""
+        roots = [base_yaml.parent, Path.cwd(), Path(__file__).resolve().parents[1]]
+        if dataset_root is not None:
+            roots.insert(0, dataset_root)
+        out: List[Path] = []
+        for r in roots:
+            try:
+                rp = Path(r).resolve()
+                if rp.exists() and rp not in out:
+                    out.append(rp)
+            except OSError:
+                pass
+        return out
+
+    @staticmethod
+    def _resolve_split_entry(raw: str, roots: List[Path]) -> Optional[Path]:
+        s = str(raw).strip().strip('"').strip("'")
+        if not s:
+            return None
+        p = Path(s)
+        candidates: List[Path] = []
+        if p.is_absolute():
+            candidates.append(p)
+        else:
+            for root in roots:
+                candidates.append(root / p)
+            # Cứu path kiểu /kaggle/working/.../data/... hoặc outputs/...
+            for marker in ("data/", "outputs/"):
+                idx = s.replace("\\", "/").find(marker)
+                if idx >= 0:
+                    candidates.append(Path(__file__).resolve().parents[1] / s[idx:])
+        for c in candidates:
+            try:
+                if c.exists():
+                    return c.resolve()
+            except OSError:
+                continue
+        return None
+
+    @classmethod
+    def _expand_split_value(
+        cls,
+        value,
+        base_yaml: Path,
+        dataset_root: Optional[Path],
+    ) -> List[str]:
+        """Mở rộng train/val từ directory, file ảnh hoặc file list .txt."""
+        roots = cls._split_path_roots(base_yaml, dataset_root)
+
+        def read_one(v) -> List[str]:
+            resolved = cls._resolve_split_entry(str(v), roots)
+            if resolved is None:
+                logger.warning(f"[Dataset Exporter] Không tìm thấy split entry: {v}")
+                return []
+            if resolved.is_dir():
+                return sorted(
+                    p.resolve().as_posix()
+                    for p in resolved.rglob("*")
+                    if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+                )
+            if resolved.suffix.lower() in {".txt", ".csv"}:
+                out: List[str] = []
+                with open(resolved, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        item = line.split(",")[0].strip() if resolved.suffix.lower() == ".csv" else line
+                        p = cls._resolve_split_entry(item, [resolved.parent] + roots)
+                        if p is not None and p.is_file():
+                            out.append(p.resolve().as_posix())
+                return out
+            if resolved.is_file():
+                return [resolved.resolve().as_posix()]
+            return []
+
+        results: List[str] = []
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                results.extend(read_one(item))
+        elif value is not None:
+            results.extend(read_one(value))
+        return list(dict.fromkeys(results))
+
     def _export_augmented_dataset(
         self,
         synthetic_img_paths: List[str],
@@ -559,49 +650,98 @@ class QualityFilter:
         base_yaml_path: Optional[Union[str, Path]],
     ):
         """
-        Gộp danh sách ảnh lỗi thực tế (10% low-data) và ảnh tổng hợp accepted
-        thành file augmented_train.txt và file augmented_dataset.yaml.
+        Gộp ảnh thật low-data + ảnh synthetic accepted thành một YAML tự chứa.
+
+        - Không ghi ``path: .`` rồi để val là path tương đối dễ hỏng.
+        - Train/val được resolve và ghi thành list tuyệt đối tại runtime.
+        - Nếu base YAML không hợp lệ, dừng với lỗi rõ ràng thay vì tạo YAML rác.
         """
-        real_train_imgs = []
-        val_img_source = ""
+        if not base_yaml_path:
+            # filter_by_class gọi inner filter với data_yaml=None; không xuất
+            # YAML rác trong từng thư mục class. YAML cuối được xuất ở lần gọi
+            # filter_by_class bên ngoài.
+            return
 
-        # Đọc cấu hình dataset gốc nếu có
-        if base_yaml_path and Path(base_yaml_path).exists():
+        base_yaml = Path(base_yaml_path)
+        if not base_yaml.exists():
+            raise FileNotFoundError(
+                f"[Dataset Exporter] Không tìm thấy base dataset YAML: {base_yaml}"
+            )
+
+        import yaml
+
+        with open(base_yaml, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        dataset_root: Optional[Path] = None
+        declared_path = cfg.get("path")
+        if declared_path:
+            dataset_root = self._resolve_split_entry(str(declared_path), self._split_path_roots(base_yaml, None))
+            if dataset_root is None:
+                # path: . phổ biến trong YAML cũ
+                try:
+                    dataset_root = (base_yaml.parent / str(declared_path)).resolve()
+                except OSError:
+                    dataset_root = base_yaml.parent.resolve()
+
+        real_train_imgs = self._expand_split_value(cfg.get("train"), base_yaml, dataset_root)
+        val_imgs = self._expand_split_value(cfg.get("val"), base_yaml, dataset_root)
+        if not real_train_imgs:
+            raise RuntimeError(
+                f"[Dataset Exporter] Base YAML {base_yaml} không đọc được ảnh train thực. "
+                "Kiểm tra lại data/id_setup.yaml và file list."
+            )
+        if not val_imgs:
+            raise RuntimeError(
+                f"[Dataset Exporter] Base YAML {base_yaml} không đọc được ảnh val. "
+                "Không thể tạo augmented_dataset.yaml thiếu val."
+            )
+
+        synthetic_resolved: List[str] = []
+        for p in synthetic_img_paths:
+            if not p:
+                continue
             try:
-                import yaml
-                with open(base_yaml_path, "r", encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f)
+                pp = Path(p).resolve()
+                if pp.exists():
+                    synthetic_resolved.append(pp.as_posix())
+                else:
+                    logger.warning(f"[Dataset Exporter] Bỏ qua ảnh synthetic không tồn tại: {p}")
+            except OSError:
+                continue
 
-                train_ref = cfg.get("train", "")
-                val_img_source = cfg.get("val", "")
-
-                if train_ref and Path(train_ref).exists():
-                    with open(train_ref, "r", encoding="utf-8") as f:
-                        real_train_imgs = [line.strip() for line in f if line.strip()]
-            except Exception as e:
-                logger.warning(f"Không thể đọc base dataset YAML {base_yaml_path}: {e}")
-
-        # Gộp danh sách ảnh thực và ảnh sinh
-        merged_train_imgs = list(real_train_imgs) + [p.replace("\\", "/") for p in synthetic_img_paths if p]
+        merged_train_imgs = list(dict.fromkeys(real_train_imgs + synthetic_resolved))
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         aug_train_txt = output_dir / "augmented_train.txt"
-        with open(aug_train_txt, "w", encoding="utf-8") as f:
-            for p in merged_train_imgs:
-                f.write(f"{p}\n")
+        aug_val_txt = output_dir / "augmented_val.txt"
+        aug_train_txt.write_text("\n".join(merged_train_imgs) + "\n", encoding="utf-8")
+        aug_val_txt.write_text("\n".join(val_imgs) + "\n", encoding="utf-8")
 
-        # Tạo file YAML mở rộng
+        names = cfg.get("names", PCB_DEFECT_CLASSES)
+        if isinstance(names, dict):
+            names = [names[k] for k in sorted(names.keys(), key=lambda x: int(x))]
+        if not isinstance(names, list) or not names:
+            names = list(PCB_DEFECT_CLASSES)
+
         aug_yaml_path = output_dir / "augmented_dataset.yaml"
         aug_yaml_content = (
-            f"# Augmented PCB Defect Dataset (Real 10% + Top 75% Accepted Synthetic)\n"
-            f"path: .\n"
+            "# Augmented PCB Defect Dataset (Real low-data + Top 75% accepted synthetic)\n"
+            "# Auto-generated by step3_quality_filter.py; runtime-absolute paths.\n"
+            f"path: {output_dir.resolve().as_posix()}\n"
             f"train: {aug_train_txt.resolve().as_posix()}\n"
-            f"val: {val_img_source}\n\n"
-            f"nc: 6\n"
-            f"names: {PCB_DEFECT_CLASSES}\n"
+            f"val: {aug_val_txt.resolve().as_posix()}\n\n"
+            f"nc: {len(names)}\n"
+            f"names: {names}\n"
         )
         aug_yaml_path.write_text(aug_yaml_content, encoding="utf-8")
-        logger.info(f"[Dataset Exporter] Đã tạo Augmented Dataset YAML: {aug_yaml_path}")
-        logger.info(f"  Tổng ảnh train: {len(merged_train_imgs)} (Thực: {len(real_train_imgs)} + Tổng hợp: {len(synthetic_img_paths)})")
+        logger.info(f"[Dataset Exporter] Đã tạo Augmented Dataset YAML: {aug_yaml_path.resolve()}")
+        logger.info(
+            f"  Tổng ảnh train: {len(merged_train_imgs)} "
+            f"(Thực: {len(real_train_imgs)} + Synthetic: {len(synthetic_resolved)}) | "
+            f"Val: {len(val_imgs)}"
+        )
 
 
 # ─────────────────────────────────────────────────────────
@@ -619,7 +759,7 @@ if __name__ == "__main__":
     tr = subparsers.add_parser("train_judge", help="Huấn luyện YOLO11 judge trên ảnh lỗi thực")
     tr.add_argument("--data_yaml",   default="data/id_setup.yaml", help="File cấu hình dataset lỗi thực (ID 10%)")
     tr.add_argument("--epochs",      type=int, default=100, help="Số epochs huấn luyện (chuẩn bài báo là 100)")
-    tr.add_argument("--batch",       type=int, default=16, help="Batch size")
+    tr.add_argument("--batch",       type=int, default=8, help="Batch size (8 phù hợp GPU 6GB)")
     tr.add_argument("--model_size",  default="s", choices=["n", "s", "m", "l", "x"], help="Kích thước mô hình YOLO11")
     tr.add_argument("--device",      default="cuda", help="Thiết bị tính toán (cuda / cpu)")
     tr.add_argument("--project",     default="outputs/yolo_training", help="Thư mục lưu weights")

@@ -1,168 +1,53 @@
 """
-Environment Path Adapter for PCB Defect Pipeline
-================================================
-Tự động chuẩn hóa toàn bộ đường dẫn trong:
-- data/id_setup.yaml
-- data/npi_setup.yaml
-- data/prepared_splits/*.txt
-- data/train_metadata.json
+Legacy path-helper compatibility script.
 
-Hỗ trợ 2 chế độ:
-- 'relative' (Mặc định - Khuyên dùng khi chia sẻ GitHub): Dùng đường dẫn tương đối để chạy được trên mọi máy.
-- 'absolute': Chuyển thành đường dẫn tuyệt đối theo máy hiện tại (Windows / Linux / Colab).
+Các file YAML/JSON/split của pipeline hiện dùng đường dẫn tuyệt đối được sinh
+tại runtime bởi `pcb_pipeline/data_module.py`. Script này KHÔNG còn sửa đường
+dẫn nữa (sửa thủ công dễ làm sai split hoặc làm lẫn official val/test).
+
+Chức năng hiện tại: kiểm tra nhanh data prep đã hợp lệ hay chưa.
 """
 
-import sys
-import json
+from __future__ import annotations
+
 import argparse
-from pathlib import Path
+import sys
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-def adapt_paths(project_root: Path = None, mode: str = "relative"):
-    if project_root is None:
-        project_root = Path(__file__).resolve().parent
 
-    data_dir = project_root / "data"
-    splits_dir = data_dir / "prepared_splits"
-    raw_dataset_dir = data_dir / "pcb-defect-dataset"
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Kiểm tra data prep (không sửa đường dẫn)"
+    )
+    parser.add_argument(
+        "--mode",
+        default="relative",
+        choices=["relative", "absolute"],
+        help="Tham số cũ, được giữ để không làm hỏng script cũ; hiện bị bỏ qua.",
+    )
+    args = parser.parse_args()
 
-    print("=" * 60)
-    print(f"Đang chuẩn hóa đường dẫn [Chế độ: {mode.upper()}] cho môi trường: {sys.platform}")
-    print(f"Thư mục gốc dự án: {project_root}")
-    print("=" * 60)
+    from run_pipeline import DATA_DIR, _validate_data_prep
 
-    # Kiểm tra xem dataset gốc đã được tải về hay chưa
-    if not raw_dataset_dir.exists():
-        print(f"Chưa tìm thấy thư mục: {raw_dataset_dir}")
-        print("Vui lòng tải dataset và giải nén vào thư mục: data/pcb-defect-dataset/")
-    else:
-        # Tự động kiểm tra và sinh 799 ảnh normal sạch nếu chưa có
-        normal_dir = data_dir / "pcb_normal"
-        normals = list(normal_dir.glob("*.jpg")) + list(normal_dir.glob("*.png")) if normal_dir.exists() else []
-        if len(normals) < 100:
-            print("Phát hiện chưa có thư mục data/pcb_normal (799 ảnh phôi sạch).")
-            print("   Đang tự động khởi chạy data_module để sinh 799 ảnh normal theo chuẩn bài báo...")
-            try:
-                from pcb_pipeline.data_module import PCBDataModule
-                dm = PCBDataModule(raw_dataset_dir=raw_dataset_dir, output_dir=data_dir)
-                dm.run_pipeline()
-            except Exception as e:
-                print(f"Lỗi khi tự động chạy data_module: {e}")
+    ok, reason = _validate_data_prep(DATA_DIR, 799)
+    print("=" * 66)
+    print("KIỂM TRA DATA PREP")
+    print("=" * 66)
+    print(f"Thư mục dữ liệu: {DATA_DIR}")
+    print(f"Trạng thái:      {'HỢP LỆ' if ok else 'KHÔNG HỢP LỆ'}")
+    print(f"Chi tiết:        {reason}")
+    print("Lưu ý: script không sửa file nào; --mode chỉ để tương thích lệnh cũ.")
+    print("=" * 66)
 
-    # 1. Chuẩn hóa các file .txt trong data/prepared_splits/
-    txt_files = list(splits_dir.glob("*.txt"))
-    for txt_file in txt_files:
-        lines = txt_file.read_text(encoding="utf-8").splitlines()
-        updated_lines = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            normalized_line = line.replace("\\", "/")
-            if "data/pcb-defect-dataset" in normalized_line:
-                subpath = normalized_line.split("data/pcb-defect-dataset/")[-1]
-            elif "pcb-defect-dataset" in normalized_line:
-                subpath = normalized_line.split("pcb-defect-dataset/")[-1]
-            else:
-                subpath = Path(line).name
+    if not ok:
+        print("Hãy chạy: python run_pipeline.py prepare_data --force")
+        return 1
+    return 0
 
-            if mode == "absolute":
-                target_path = str((raw_dataset_dir / subpath).resolve()).replace("\\", "/")
-            else:
-                target_path = f"data/pcb-defect-dataset/{subpath}".replace("\\", "/")
-
-            updated_lines.append(target_path)
-
-        with open(txt_file, "w", encoding="utf-8") as f:
-            for p in updated_lines:
-                f.write(f"{p}\n")
-        print(f"  Cập nhật {len(updated_lines)} đường dẫn trong: {txt_file.name}")
-
-    # 2. Chuẩn hóa data/id_setup.yaml và data/npi_setup.yaml
-    if mode == "absolute":
-        id_train_ref = str((splits_dir / "id_train_low.txt").resolve()).replace("\\", "/")
-        id_val_ref = str((splits_dir / "id_val.txt").resolve()).replace("\\", "/")
-        npi_train_ref = str((splits_dir / "npi_train_low.txt").resolve()).replace("\\", "/")
-        npi_val_ref = str((splits_dir / "npi_val_unseen.txt").resolve()).replace("\\", "/")
-    else:
-        id_train_ref = "data/prepared_splits/id_train_low.txt"
-        id_val_ref = "data/prepared_splits/id_val.txt"
-        npi_train_ref = "data/prepared_splits/npi_train_low.txt"
-        npi_val_ref = "data/prepared_splits/npi_val_unseen.txt"
-
-    proj_root_str = str(project_root).replace("\\", "/")
-    id_yaml_path = data_dir / "id_setup.yaml"
-    if id_yaml_path.exists():
-        path_line = f"path: {proj_root_str}\n" if mode == "absolute" else "path: .\n"
-        content_id = f"""# In-Distribution (ID) Dataset Config (10% Low-Data)
-{path_line}train: {id_train_ref}
-val: {id_val_ref}
-
-nc: 6
-names: ['mouse_bite', 'spur', 'missing_hole', 'short', 'open_circuit', 'spurious_copper']
-"""
-        id_yaml_path.write_text(content_id, encoding="utf-8")
-        print(f"  Cập nhật: {id_yaml_path.name}")
-
-    npi_yaml_path = data_dir / "npi_setup.yaml"
-    if npi_yaml_path.exists():
-        path_line = f"path: {proj_root_str}\n" if mode == "absolute" else "path: .\n"
-        content_npi = f"""# New Product Introduction (NPI) Dataset Config
-# Train trên Seen Products, Val trên 100% Unseen Products
-{path_line}train: {npi_train_ref}
-val: {npi_val_ref}
-
-nc: 6
-names: ['mouse_bite', 'spur', 'missing_hole', 'short', 'open_circuit', 'spurious_copper']
-"""
-        npi_yaml_path.write_text(content_npi, encoding="utf-8")
-        print(f"  Cập nhật: {npi_yaml_path.name}")
-
-    # 3. Chuẩn hóa data/train_metadata.json
-    meta_path = data_dir / "train_metadata.json"
-    if meta_path.exists():
-        with open(meta_path, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-
-        for item in metadata:
-            img_p = item.get("image_path", "").replace("\\", "/")
-            lbl_p = item.get("label_path", "").replace("\\", "/")
-
-            if "data/pcb-defect-dataset" in img_p:
-                sub_img = img_p.split("data/pcb-defect-dataset/")[-1]
-            elif "pcb-defect-dataset" in img_p:
-                sub_img = img_p.split("pcb-defect-dataset/")[-1]
-            else:
-                sub_img = Path(img_p).name
-
-            if "data/pcb-defect-dataset" in lbl_p:
-                sub_lbl = lbl_p.split("data/pcb-defect-dataset/")[-1]
-            elif "pcb-defect-dataset" in lbl_p:
-                sub_lbl = lbl_p.split("pcb-defect-dataset/")[-1]
-            else:
-                sub_lbl = Path(lbl_p).name
-
-            if mode == "absolute":
-                item["image_path"] = str((raw_dataset_dir / sub_img).resolve()).replace("\\", "/")
-                item["label_path"] = str((raw_dataset_dir / sub_lbl).resolve()).replace("\\", "/")
-            else:
-                item["image_path"] = f"data/pcb-defect-dataset/{sub_img}".replace("\\", "/")
-                item["label_path"] = f"data/pcb-defect-dataset/{sub_lbl}".replace("\\", "/")
-
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2, ensure_ascii=False)
-        print(f"  Cập nhật {len(metadata)} bản ghi trong: {meta_path.name}")
-
-    print("=" * 60)
-    print("TẤT CẢ ĐƯỜNG DẪN ĐÃ ĐƯỢC ĐỒNG BỘ THÀNH CÔNG!")
-    print("=" * 60)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Environment Path Adapter")
-    parser.add_argument("--mode", default="relative", choices=["relative", "absolute"], help="Chế độ đường dẫn")
-    args = parser.parse_args()
-    adapt_paths(mode=args.mode)
+    raise SystemExit(main())

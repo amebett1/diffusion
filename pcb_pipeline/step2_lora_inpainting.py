@@ -1,29 +1,31 @@
 """
 Step 2: Defect Image Synthesis using Inpainting Diffusion + LoRA + Multi-Token Textual Inversion
 ================================================================================================
-Triển khai chuẩn theo bài báo:
+Triển khai theo bài báo:
 "A Synthetic Defect Image Generation Method for Enhanced Industrial
 Defect Detection Based on Inpainting Diffusion and Context-aware Mask Generation"
 (Journal of Intelligent Manufacturing, 2026 - Mục Methods, Trang 5)
 
-Các điểm kỹ thuật cốt lõi:
-1. Multi-Token Textual Inversion:
-   - Gán 1 token học riêng cho mỗi loại lỗi (6 tokens cho 6 lớp lỗi PCB).
-   - Prompt lỗi P:  "a photo of a pcb with <defect_type>"
-   - Prompt chuẩn P': "a photo of a pcb"
-2. Parameter-Efficient LoRA (r=8, α=16):
-   - Gắn vào Attention projections và Output projections của CẢ U-Net và Text Encoder.
-   - Learning rate: 1e-4 cho U-Net, 5e-5 cho Text Encoder, 5e-4 cho Textual Inversion.
-3. Hàm mất mát kép (Dual Loss Function - Equations 6, 7, 8):
-   - L_def = E [ B  * ||ε - ε_θ(x_t, B,  t, τ(P)) ||^2_2 ]  (trên mask lỗi B)
-   - L_rec = E [ B' * ||ε - ε_θ(x_t, B', t, τ(P'))||^2_2 ] (trên box ngẫu nhiên B' ∈ [Q1, Q3])
-   - L_tot = L_def + λ * L_rec  (λ = 0.1)
-4. Denoising Pipeline với cơ chế Latent Overwriting:
-   - 50 Denoising steps (DDIM Scheduler).
-   - Latent Overwriting tại mỗi bước khử nhiễu t (Trang 5 bài báo):
-       z_{t-1} = B_lat ⊙ z_{t-1, synthesized} + (1 - B_lat) ⊙ z_{t-1, orig}
-     giúp bảo toàn 100% cấu trúc nền của bo mạch.
-   - Negative prompt: "blurry, low quality, deformed, ugly, watermark, signature, text, logo".
+Các điểm kỹ thuật cốt lõi
+------------------------
+1. Multi-Token Textual Inversion cho 6 loại lỗi PCB.
+2. LoRA (r=8, alpha=16) trên Attention/Output projections của U-Net và Text Encoder.
+3. Dual Loss: L_def + 0.1 * L_rec, với B' lấy trong vùng không lỗi và
+   kích thước theo phân vị Q1-Q3 của DeepPCB.
+4. Denoising 50 bước với DDIM + Latent Overwriting nhất quán.
+
+Các sửa lỗi quan trọng so với bản cũ
+------------------------------------
+- Latent Overwriting dùng MỘT noise nền cố định (noise_bg) cho toàn bộ
+  quỹ đạo khử nhiễu. Bản cũ gọi torch.randn_like() mới ở từng bước, làm
+  nền bị đổi nhiễu liên tục và vỡ vùng tiếp giáp B / (1-B).
+- Composite cuối dùng alpha mask được feather 2-3 px, chỉ trong vùng mask
+  dilation; ngoài vùng đó pixel gốc được giữ nguyên 100%.
+- Ảnh được xử lý ở độ phân giải gần native (bội số của 8, tối đa cấu hình)
+  thay vì luôn resize 600 -> 512 -> 600. Với ảnh 600x600, VAE/UNet chạy
+  trực tiếp 600x600 để không làm mờ micro-trace.
+- Fail-fast nếu thiếu diffusers hoặc checkpoint LoRA/TI được yêu cầu nhưng
+  không tồn tại; không âm thầm chạy base model/fallback rồi coi như đã tái lập.
 """
 
 import os
@@ -42,10 +44,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_STATS_PATH = PROJECT_ROOT / "data" / "dataset_stats.json"
 
 # Danh sách 6 lớp lỗi PCB chuẩn DeepPCB & Paper
 PCB_DEFECT_CLASSES = [
@@ -57,7 +61,6 @@ PCB_DEFECT_CLASSES = [
     "spurious_copper",
 ]
 
-# Ánh xạ từ vựng khởi tạo ngữ nghĩa cho từng token
 INIT_TOKENS = {
     "mouse_bite": "notch",
     "spur": "spur",
@@ -98,141 +101,144 @@ class MultiTokenTIManager:
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
 
-        # Map placeholder tokens: "<mouse_bite>", "<spur>", v.v.
         self.placeholder_tokens = {c: f"<{c}>" for c in self.defect_classes}
-        self.token_ids = {}
-        self.placeholder_token_ids = []
+        self.token_ids: Dict[str, int] = {}
+        self.placeholder_token_ids: List[int] = []
+        self.ti_parameters = nn.ParameterDict()
+        self._embedding_forward_patched = False
 
         if self.tokenizer is not None and self.text_encoder is not None:
             self._initialize_tokens()
 
     @property
     def ti_params(self) -> Dict[str, torch.Tensor]:
-        """Truy xuất embedding tensor của các token lỗi (phục vụ logging / debug)."""
-        if self.text_encoder is not None:
-            weight = self.text_encoder.get_input_embeddings().weight
-            return {c: weight[tid] for c, tid in self.token_ids.items()}
-        return {}
+        return dict(self.ti_parameters)
 
     def _initialize_tokens(self):
-        """Thêm các placeholder tokens vào tokenizer và trích xuất vector embedding khởi tạo."""
+        """Thêm placeholder tokens và khởi tạo embedding từ từ ngữ gần nghĩa."""
         logger.info(f"[TI] Đang khởi tạo {len(self.defect_classes)} tokens Textual Inversion...")
-        self.placeholder_token_ids = []
+
         for cls_name, placeholder in self.placeholder_tokens.items():
-            num_added = self.tokenizer.add_tokens(placeholder)
-            token_id = self.tokenizer.convert_tokens_to_ids(placeholder)
-            self.token_ids[cls_name] = token_id
-            self.placeholder_token_ids.append(token_id)
+            self.tokenizer.add_tokens(placeholder)
+            self.token_ids[cls_name] = self.tokenizer.convert_tokens_to_ids(placeholder)
+            self.placeholder_token_ids.append(self.token_ids[cls_name])
 
-            # Tìm embedding của từ khởi tạo tương ứng
-            init_word = INIT_TOKENS.get(cls_name, "defect")
-            init_ids = self.tokenizer.encode(init_word, add_special_tokens=False)
-            init_id = init_ids[0] if init_ids else self.tokenizer.unk_token_id
+        # Resize một lần sau khi đã thêm tất cả token.
+        self.text_encoder.resize_token_embeddings(len(self.tokenizer))
+        embedding = self.text_encoder.get_input_embeddings()
+        weight = embedding.weight
 
-            self.text_encoder.resize_token_embeddings(len(self.tokenizer))
-            with torch.no_grad():
-                init_emb = self.text_encoder.get_input_embeddings().weight[init_id].clone()
-                self.text_encoder.get_input_embeddings().weight[token_id] = init_emb
+        with torch.no_grad():
+            for cls_name in self.placeholder_tokens:
+                init_word = INIT_TOKENS.get(cls_name, "defect")
+                init_ids = self.tokenizer.encode(init_word, add_special_tokens=False)
+                init_id = init_ids[0] if init_ids else self.tokenizer.unk_token_id
+                token_id = self.token_ids[cls_name]
+                weight[token_id] = weight[init_id].clone()
 
-        # Kích hoạt Autograd trực tiếp trên Embedding Table
-        self.text_encoder.get_input_embeddings().weight.requires_grad_(True)
-        # Lưu bản sao ban đầu của từ điển để bảo toàn các token gốc không bị trôi
-        self.orig_embeds_params = self.text_encoder.get_input_embeddings().weight.data.clone()
-        logger.info(f"[TI] Đã đăng ký và gắn kết Autograd cho các token: {list(self.placeholder_tokens.values())}")
+        # Chỉ 6 vector token là tham số huấn luyện, ở fp32.
+        # Không dùng cả bảng embedding 49k dòng: tránh gradient fp16 và tốn VRAM.
+        weight.requires_grad_(False)
+        self.ti_parameters = nn.ParameterDict({
+            cls_name: nn.Parameter(weight[token_id].detach().float().clone())
+            for cls_name, token_id in self.token_ids.items()
+        })
+
+        # Patch token_embedding.forward: lấy bảng gốc (frozen) rồi thay 6 hàng
+        # bằng tham số TI. Gradient chỉ chảy vào 6 vector fp32.
+        if not self._embedding_forward_patched:
+            manager = self
+
+            def ti_embedding_forward(input_ids):
+                out = F.embedding(input_ids, embedding.weight)
+                for cls_name, token_id in manager.token_ids.items():
+                    vec = manager.ti_parameters[cls_name].to(
+                        device=out.device, dtype=out.dtype
+                    )
+                    out = torch.where(
+                        (input_ids == token_id).unsqueeze(-1),
+                        vec.view(1, 1, -1),
+                        out,
+                    )
+                return out
+
+            embedding.forward = ti_embedding_forward
+            self._embedding_forward_patched = True
+
+        logger.info(
+            f"[TI] Đã đăng ký các token: {list(self.placeholder_tokens.values())}"
+        )
 
     def get_trainable_params(self) -> List[nn.Parameter]:
-        """Trả về tham số embedding table cho Optimizer."""
-        if self.text_encoder is None:
-            return []
-        return [self.text_encoder.get_input_embeddings().weight]
+        return list(self.ti_parameters.values())
 
     def zero_non_placeholder_grads(self):
-        """
-        Triệt tiêu gradient của toàn bộ token gốc trong CLIP vocab,
-        chỉ bảo toàn gradient cho 6 placeholder tokens (<mouse_bite>, <spur>,...).
-        Đây là kỹ thuật chuẩn của Textual Inversion giúp đồ thị Autograd không bị đứt.
-        """
-        if self.text_encoder is None:
-            return
-        embeds = self.text_encoder.get_input_embeddings()
-        if embeds.weight.grad is not None:
-            mask = torch.ones(embeds.weight.shape[0], dtype=torch.bool, device=embeds.weight.device)
-            for tid in self.token_ids.values():
-                mask[tid] = False
-            embeds.weight.grad[mask] = 0.0
+        # Bảng embedding gốc đã frozen; không cần zero gradient.
+        return
 
     def restore_non_placeholder_embeddings(self):
-        """Khôi phục lại chính xác trọng số các token vocab gốc nếu bị weight decay làm lệch."""
-        if self.text_encoder is None or not hasattr(self, "orig_embeds_params"):
-            return
-        with torch.no_grad():
-            weight = self.text_encoder.get_input_embeddings().weight
-            mask = torch.ones(weight.shape[0], dtype=torch.bool, device=weight.device)
-            for tid in self.token_ids.values():
-                mask[tid] = False
-            weight.data[mask] = self.orig_embeds_params[mask].to(weight.device)
+        # Bảng embedding gốc không bao giờ bị optimizer cập nhật.
+        return
 
     def sync_embeddings(self):
-        """Placeholder tương thích ngược. Trọng số embedding table đã nằm trong đồ thị Autograd."""
-        pass
+        return
 
     def get_defect_prompt(self, defect_type: str) -> str:
-        """Prompt P theo Equation 6 của bài báo."""
         token = self.placeholder_tokens.get(defect_type, f"<{defect_type}>")
         return f"a photo of a {self.product_name} with {token}"
 
     def get_normal_prompt(self) -> str:
-        """Prompt P' theo Equation 7 của bài báo."""
         return f"a photo of a {self.product_name}"
 
     def save(self, output_path: Union[str, Path]):
-        """Lưu trọng số của toàn bộ 6 TI tokens."""
-        state = {}
-        if self.text_encoder is not None:
-            weight = self.text_encoder.get_input_embeddings().weight.detach().cpu()
-            for cls_name, token_id in self.token_ids.items():
-                state[cls_name] = weight[token_id].clone()
+        state = {
+            cls_name: param.detach().cpu().clone()
+            for cls_name, param in self.ti_parameters.items()
+        }
         torch.save(state, output_path)
         logger.info(f"[TI] Đã lưu TI embeddings -> {output_path}")
 
     def load(self, checkpoint_path: Union[str, Path]):
-        """Nạp trọng số TI tokens từ checkpoint vào embedding table."""
         state = torch.load(checkpoint_path, map_location=self.device)
-        if self.text_encoder is not None:
-            weight = self.text_encoder.get_input_embeddings().weight
-            with torch.no_grad():
-                for cls_name, emb_data in state.items():
-                    if cls_name in self.token_ids:
-                        tid = self.token_ids[cls_name]
-                        weight[tid] = emb_data.to(self.device)
-        logger.info(f"[TI] Đã nạp TI embeddings <- {checkpoint_path}")
+        loaded = 0
+        with torch.no_grad():
+            for cls_name, emb_data in state.items():
+                if cls_name in self.ti_parameters:
+                    param = self.ti_parameters[cls_name]
+                    param.data.copy_(
+                        emb_data.to(device=param.device, dtype=param.dtype)
+                    )
+                    loaded += 1
+        logger.info(f"[TI] Đã nạp {loaded}/{len(self.token_ids)} TI embeddings <- {checkpoint_path}")
 
 
 # ─────────────────────────────────────────────────────────
-# 2. Native LoRA Layers (Cho cả U-Net và Text Encoder)
+# 2. Native LoRA Layers
 # ─────────────────────────────────────────────────────────
 
 class LoRALinearLayer(nn.Module):
-    """
-    Lớp LoRA: ΔW = (α / r) * B * A
-    Huấn luyện tham số bậc thấp với r=8, α=16 theo paper.
-    """
+    """ΔW = (α / r) * B * A, với r=8, α=16 theo paper."""
 
     def __init__(self, in_features: int, out_features: int, rank: int = 8, alpha: float = 16.0):
         super().__init__()
         self.rank = rank
         self.alpha = alpha
         self.scale = alpha / rank
-
-        # Ma trận A khởi tạo Gaussian, Ma trận B khởi tạo 0
         self.lora_A = nn.Parameter(torch.randn(rank, in_features) * (1.0 / math.sqrt(in_features)))
         self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.lora_A.device != x.device:
-            self.lora_A.data = self.lora_A.data.to(x.device)
-            self.lora_B.data = self.lora_B.data.to(x.device)
-        return self.scale * F.linear(F.linear(x, self.lora_A), self.lora_B)
+        # Giữ tham số LoRA ở fp32 để GradScaler/AdamW hoạt động ổn định,
+        # chỉ cast tạm sang dtype của activation khi chạy forward.
+        a = self.lora_A
+        b = self.lora_B
+        if a.device != x.device:
+            a = a.to(x.device)
+            b = b.to(x.device)
+        if a.dtype != x.dtype:
+            a = a.to(x.dtype)
+            b = b.to(x.dtype)
+        return self.scale * F.linear(F.linear(x, a), b)
 
 
 def inject_lora_into_model(
@@ -241,113 +247,125 @@ def inject_lora_into_model(
     alpha: float = 16.0,
     target_modules: Optional[List[str]] = None,
 ) -> Dict[str, LoRALinearLayer]:
-    """
-    Gắn các lớp LoRA vào các Attention projection layers và Output projection layers
-    của model (U-Net hoặc Text Encoder).
-    """
+    """Gắn LoRA vào Attention/Output projection layers."""
     if target_modules is None:
-        target_modules = ["to_q", "to_k", "to_v", "to_out.0", "q_proj", "k_proj", "v_proj", "out_proj"]
+        target_modules = [
+            "to_q", "to_k", "to_v", "to_out.0",
+            "q_proj", "k_proj", "v_proj", "out_proj",
+        ]
 
-    lora_layers = {}
+    lora_layers: Dict[str, LoRALinearLayer] = {}
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            if any(name.endswith(tgt) or tgt in name for tgt in target_modules):
-                in_feat, out_feat = module.in_features, module.out_features
-                target_device = module.weight.device
-                target_dtype = module.weight.dtype
-                lora_layer = LoRALinearLayer(in_feat, out_feat, rank=rank, alpha=alpha).to(
-                    device=target_device, dtype=target_dtype
-                )
-                lora_layers[name] = lora_layer
-                setattr(module, "lora_layer", lora_layer)
+        if isinstance(module, nn.Linear) and any(
+            name.endswith(tgt) or tgt in name for tgt in target_modules
+        ):
+            lora_layer = LoRALinearLayer(
+                module.in_features,
+                module.out_features,
+                rank=rank,
+                alpha=alpha,
+            ).to(device=module.weight.device, dtype=torch.float32)
+            lora_layers[name] = lora_layer
+            setattr(module, "lora_layer", lora_layer)
 
-                orig_forward = module.forward
+            orig_forward = module.forward
 
-                def make_new_forward(m, orig_f):
-                    def forward_fn(x):
-                        dev = m.lora_layer.lora_A.device
-                        dtype = m.lora_layer.lora_A.dtype
-                        x_lora = x.to(device=dev, dtype=dtype) if (x.device != dev or x.dtype != dtype) else x
-                        return orig_f(x) + m.lora_layer(x_lora)
-                    return forward_fn
+            def make_new_forward(m, orig_f):
+                def forward_fn(x):
+                    return orig_f(x) + m.lora_layer(x)
+                return forward_fn
 
-                module.forward = make_new_forward(module, orig_forward)
+            module.forward = make_new_forward(module, orig_forward)
 
     logger.info(f"[LoRA] Đã gắn LoRA vào {len(lora_layers)} layers (rank={rank}, alpha={alpha}).")
     return lora_layers
 
 
 # ─────────────────────────────────────────────────────────
-# 3. Hàm mất mát kép (Dual Loss Function) & Lấy mẫu BBox B'
+# 3. Dual Loss & Negative Box Sampling
 # ─────────────────────────────────────────────────────────
 
 class DualInpaintLoss(nn.Module):
     """
-    Triển khai hàm mất mát kép theo Equation 6, 7, 8 của bài báo:
-      L_def = E [ B  * ||ε - ε_θ(x_t, B,  t, τ(P)) ||^2_2 ]
-      L_rec = E [ B' * ||ε - ε_θ(x_t, B', t, τ(P'))||^2_2 ]
-      L_tot = L_def + λ * L_rec  (λ = 0.1)
+    L_def = E[B * ||ε - ε_θ(x_t, B, t, τ(P))||²]
+    L_rec = E[B' * ||ε - ε_θ(x_t, B', t, τ(P'))||²]
+    L_tot = L_def + λ * L_rec, λ = 0.1.
 
-    Trong đó B' là mask bounding box ngẫu nhiên lấy từ vùng không lỗi,
-    có kích thước nằm trong khoảng phân vị [Q1, Q3] của tập lỗi thực tế.
+    B' là box ngẫu nhiên trong vùng không lỗi, kích thước lấy theo Q1-Q3
+    của DeepPCB (được scale theo kích thước ảnh hiện tại, mặc định 600 px).
     """
 
     def __init__(
         self,
         lambda_rec: float = 0.1,
-        stats_path: Union[str, Path] = "data/dataset_stats.json",
+        stats_path: Union[str, Path] = DEFAULT_STATS_PATH,
         default_q1: int = 21,
         default_q3: int = 36,
+        reference_size: int = 600,
     ):
         super().__init__()
         self.lambda_rec = lambda_rec
-        self.q1_w = default_q1
-        self.q3_w = default_q3
-        self.q1_h = default_q1
-        self.q3_h = default_q3
+        self.reference_size = int(reference_size)
+        self.q1_w = float(default_q1)
+        self.q3_w = float(default_q3)
+        self.q1_h = float(default_q1)
+        self.q3_h = float(default_q3)
 
         stats_file = Path(stats_path)
         if stats_file.exists():
             try:
                 with open(stats_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    px = data.get("pixel_size", {})
-                    self.q1_w = int(round(px.get("width", {}).get("q1", default_q1)))
-                    self.q3_w = int(round(px.get("width", {}).get("q3", default_q3)))
-                    self.q1_h = int(round(px.get("height", {}).get("q1", default_q1)))
-                    self.q3_h = int(round(px.get("height", {}).get("q3", default_q3)))
-                logger.info(f"[Loss] Kích thước mask B' ngẫu nhiên: Width [{self.q1_w}..{self.q3_w}], Height [{self.q1_h}..{self.q3_h}]")
+                px = data.get("pixel_size", {})
+                self.q1_w = float(px.get("width", {}).get("q1", default_q1))
+                self.q3_w = float(px.get("width", {}).get("q3", default_q3))
+                self.q1_h = float(px.get("height", {}).get("q1", default_q1))
+                self.q3_h = float(px.get("height", {}).get("q3", default_q3))
+                logger.info(
+                    f"[Loss] Kích thước B' (tại {self.reference_size}px): "
+                    f"W [{self.q1_w:.1f}..{self.q3_w:.1f}], "
+                    f"H [{self.q1_h:.1f}..{self.q3_h:.1f}]"
+                )
             except Exception as e:
                 logger.warning(f"Không thể đọc stats từ {stats_path}: {e}")
 
     def sample_negative_mask(self, defect_mask: torch.Tensor) -> torch.Tensor:
         """
-        Lấy mẫu bounding box mask B' trong vùng sạch (không chứa lỗi).
-        defect_mask: Tensor nhị phân (B, 1, H, W)
-        Returns:
-          b_prime: Tensor nhị phân (B, 1, H, W)
+        Lấy mẫu B' trong vùng sạch, không overlap defect mask.
+        Không bao giờ trả về một box overlap chỉ vì hết max_tries.
         """
-        B_batch, _, H, W = defect_mask.shape
+        b_batch, _, H, W = defect_mask.shape
         b_prime = torch.zeros_like(defect_mask)
+        scale_w = W / float(self.reference_size)
+        scale_h = H / float(self.reference_size)
 
-        for b in range(B_batch):
-            bw = random.randint(min(self.q1_w, max(1, W // 4)), min(self.q3_w, max(2, W // 2)))
-            bh = random.randint(min(self.q1_h, max(1, H // 4)), min(self.q3_h, max(2, H // 2)))
-
+        for b in range(b_batch):
             cur_mask = defect_mask[b, 0]
-            max_tries = 20
-            chosen_x1, chosen_y1 = 0, 0
+            chosen = None
 
-            for _ in range(max_tries):
-                x1 = random.randint(0, max(0, W - bw))
-                y1 = random.randint(0, max(0, H - bh))
-                overlap = cur_mask[y1:y1 + bh, x1:x1 + bw].sum()
-                if overlap == 0:
-                    chosen_x1, chosen_y1 = x1, y1
+            for attempt in range(2):
+                # Lần 1: Q1-Q3; lần 2: thu nhỏ một nửa nếu vùng sạch quá ít.
+                shrink = 0.5 if attempt == 1 else 1.0
+                bw = int(round(random.uniform(self.q1_w, self.q3_w) * scale_w * shrink))
+                bh = int(round(random.uniform(self.q1_h, self.q3_h) * scale_h * shrink))
+                bw = max(4, min(bw, max(4, W - 4)))
+                bh = max(4, min(bh, max(4, H - 4)))
+
+                for _ in range(30):
+                    x1 = random.randint(2, max(2, W - bw - 2))
+                    y1 = random.randint(2, max(2, H - bh - 2))
+                    if cur_mask[y1:y1 + bh, x1:x1 + bw].sum() == 0:
+                        chosen = (x1, y1, bw, bh)
+                        break
+                if chosen is not None:
                     break
-                chosen_x1, chosen_y1 = x1, y1
 
-            b_prime[b, 0, chosen_y1:chosen_y1 + bh, chosen_x1:chosen_x1 + bw] = 1.0
+            if chosen is None:
+                logger.debug("[Loss] Không tìm được B' sạch; bỏ qua L_rec cho mẫu này.")
+                continue
+
+            x1, y1, bw, bh = chosen
+            b_prime[b, 0, y1:y1 + bh, x1:x1 + bw] = 1.0
 
         return b_prime
 
@@ -359,16 +377,10 @@ class DualInpaintLoss(nn.Module):
         noise_pred_rec: Optional[torch.Tensor] = None,
         rec_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Tính L_tot = L_def + λ * L_rec
-        """
         m_def = F.interpolate(defect_mask, size=noise_pred_def.shape[-2:], mode="nearest")
-
-        # 1. Defect Loss (Equation 6)
         n_def_pix = m_def.sum().clamp(min=1.0)
         l_def = (m_def * (noise_target - noise_pred_def) ** 2).sum() / n_def_pix
 
-        # 2. Reconstruction Loss (Equation 7)
         if noise_pred_rec is not None and rec_mask is not None:
             m_rec = F.interpolate(rec_mask, size=noise_pred_rec.shape[-2:], mode="nearest")
             n_rec_pix = m_rec.sum().clamp(min=1.0)
@@ -376,7 +388,6 @@ class DualInpaintLoss(nn.Module):
         else:
             l_rec = torch.tensor(0.0, device=noise_pred_def.device)
 
-        # 3. Total Loss (Equation 8)
         l_tot = l_def + self.lambda_rec * l_rec
         return l_tot, l_def, l_rec
 
@@ -386,52 +397,55 @@ class DualInpaintLoss(nn.Module):
 # ─────────────────────────────────────────────────────────
 
 class PCBLoRADataset(Dataset):
-    """
-    Dataset nạp ảnh PCB thực tế và tạo mask bbox tương ứng từ train_metadata.json.
-    """
+    """Nạp ảnh PCB thực tế và tạo mask bbox từ train_metadata.json."""
 
     def __init__(self, metadata_path: Union[str, Path], image_size: int = 512):
         self.metadata_path = Path(metadata_path)
-        self.image_size = image_size
+        self.image_size = int(image_size)
+
+        if not self.metadata_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy metadata: {self.metadata_path}")
+
         with open(self.metadata_path, "r", encoding="utf-8") as f:
-            self.records = json.load(f)
+            records = json.load(f)
+
+        # Chỉ giữ record có ít nhất một bbox lỗi; ảnh normal không đóng góp L_def.
+        self.records = [r for r in records if r.get("boxes")]
+        if not self.records:
+            raise ValueError(
+                f"Không có record nào chứa bbox lỗi trong {self.metadata_path}. "
+                "Không thể huấn luyện inpainting."
+            )
+        logger.info(f"[LoRA Dataset] Dùng {len(self.records)}/{len(records)} record có bbox lỗi.")
 
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Dict[str, object]:
         rec = self.records[idx]
         img_path = rec["image_path"]
 
-        # Đọc ảnh gốc
         img_bgr = cv2.imread(img_path)
         if img_bgr is None:
-            # Fallback nếu ảnh không tồn tại
-            img_bgr = np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8)
+            raise FileNotFoundError(f"Không đọc được ảnh: {img_path}")
 
         H, W, _ = img_bgr.shape
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        # Tạo mask nhị phân từ các bounding boxes
         mask = np.zeros((H, W), dtype=np.float32)
-        defect_type = "missing_hole"
-
         boxes = rec.get("boxes", [])
-        if boxes:
-            defect_type = boxes[0].get("class_name", "missing_hole")
-            for box in boxes:
-                x1, y1 = box["x1"], box["y1"]
-                x2, y2 = box["x2"], box["y2"]
-                mask[y1:y2, x1:x2] = 1.0
-        else:
-            # Nếu không có box, tạo mask trung tâm nhỏ mặc định
-            mask[H // 4: 3 * H // 4, W // 4: 3 * W // 4] = 1.0
+        defect_type = boxes[0].get("class_name", "missing_hole")
 
-        # Resize về kích thước chuẩn
-        img_resized = cv2.resize(img_rgb, (self.image_size, self.image_size))
+        for box in boxes:
+            x1 = max(0, min(int(box["x1"]), W - 1))
+            y1 = max(0, min(int(box["y1"]), H - 1))
+            x2 = max(x1 + 1, min(int(box["x2"]), W))
+            y2 = max(y1 + 1, min(int(box["y2"]), H))
+            mask[y1:y2, x1:x2] = 1.0
+
+        img_resized = cv2.resize(img_rgb, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
         mask_resized = cv2.resize(mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
 
-        # Chuẩn hóa tensor ảnh [-1, 1] cho VAE
         img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 127.5 - 1.0
         mask_tensor = torch.from_numpy(mask_resized).unsqueeze(0).float()
 
@@ -445,18 +459,12 @@ class PCBLoRADataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────
-# 5. LoRA + Textual Inversion Trainer (Full Diffusion Training Loop)
+# 5. LoRA + Textual Inversion Trainer
 # ─────────────────────────────────────────────────────────
 
 class LoRAInpaintTrainer:
     """
-    Module quản lý huấn luyện LoRA (U-Net & Text Encoder) + Textual Inversion đa token.
-    Triển khai đầy đủ Training Loop của bài báo:
-    - VAE encode -> Latent space
-    - Timestep sampling + Noise addition
-    - Textual Inversion embedding + Prompt pairs (P, P')
-    - Dual Loss (L_def + 0.1 * L_rec) với box B' ∈ [Q1, Q3]
-    - Tích lũy Gradient chia tỷ lệ + Lưu LoRA & TI checkpoints
+    Huấn luyện LoRA (U-Net & Text Encoder) + Multi-Token Textual Inversion.
     """
 
     def __init__(
@@ -481,72 +489,161 @@ class LoRAInpaintTrainer:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.loss_fn = DualInpaintLoss(lambda_rec=0.1)
-        # Mục 1: Bật Mixed Precision (FP16 / AMP)
-        self.use_amp = use_fp16 and (self.device.type == "cuda")
+        self.loss_fn = DualInpaintLoss(lambda_rec=0.1, stats_path=DEFAULT_STATS_PATH)
+        self.use_amp = bool(use_fp16 and self.device.type == "cuda")
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.is_initialized = False
 
     def _init_models(self):
-        """Khởi tạo và đóng băng các thành phần của Diffusion Model."""
+        """Khởi tạo diffusion pipeline; fail-fast nếu thiếu diffusers."""
         try:
             from diffusers import StableDiffusionInpaintPipeline, DDPMScheduler
-            logger.info(f"[LoRA Trainer] Đang tải pipeline từ {self.model_id}...")
+        except ImportError as e:
+            raise RuntimeError(
+                "Chưa cài đặt 'diffusers'. Không thể huấn luyện LoRA inpainting.\n"
+                "Cài đặt bằng: pip install 'diffusers>=0.25.0' 'transformers>=4.37.0' accelerate\n"
+                f"Chi tiết: {e}"
+            ) from e
+
+        dtype = torch.float16 if self.use_amp else torch.float32
+        logger.info(f"[LoRA Trainer] Đang tải pipeline từ {self.model_id} ({dtype})...")
+        try:
+            load_kwargs = {
+                "torch_dtype": dtype,
+                "use_safetensors": True,
+            }
+            if dtype == torch.float16:
+                # Repo SD-inpainting chỉ có fp16 safetensors cho UNet/VAE/TextEncoder.
+                # Không có variant này, diffusers sẽ tải nhầm fp32 (rất chậm và tốn VRAM).
+                load_kwargs["variant"] = "fp16"
             pipe = StableDiffusionInpaintPipeline.from_pretrained(
                 self.model_id,
-                torch_dtype=torch.float32,
+                **load_kwargs,
             ).to(self.device)
+        except Exception as e:
+            raise RuntimeError(
+                f"Không tải được diffusion model '{self.model_id}'.\n"
+                "Kiểm tra kết nối mạng, dung lượng đĩa và quyền truy cập Hugging Face.\n"
+                f"Chi tiết: {e}"
+            ) from e
 
-            self.vae = pipe.vae
-            self.unet = pipe.unet
-            self.text_encoder = pipe.text_encoder
-            self.tokenizer = pipe.tokenizer
-            self.noise_scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
+        self.vae = pipe.vae
+        self.unet = pipe.unet
+        self.text_encoder = pipe.text_encoder
+        self.tokenizer = pipe.tokenizer
+        self.noise_scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
+        self.vae_scaling = float(getattr(self.vae.config, "scaling_factor", 0.18215))
 
-            # Đóng băng các mô hình gốc
-            self.vae.requires_grad_(False)
-            self.unet.requires_grad_(False)
-            self.text_encoder.requires_grad_(False)
+        self.vae.requires_grad_(False)
+        self.unet.requires_grad_(False)
+        self.text_encoder.requires_grad_(False)
 
-            # 1. Khởi tạo Textual Inversion Manager
-            self.ti_manager = MultiTokenTIManager(
-                tokenizer=self.tokenizer,
-                text_encoder=self.text_encoder,
-                device=str(self.device),
-            )
+        # Tối ưu cho GPU 6 GB: attention slicing + gradient checkpointing.
+        # Không đổi kiến trúc hay loss; chỉ giảm activation memory.
+        try:
+            pipe.enable_attention_slicing()
+        except Exception:
+            pass
+        try:
+            self.vae.enable_slicing()
+        except Exception:
+            pass
+        try:
+            self.unet.enable_gradient_checkpointing()
+        except Exception as exc:
+            logger.warning(f"[LoRA Trainer] Không bật được gradient checkpointing: {exc}")
 
-            # 2. Gắn LoRA vào U-Net và Text Encoder
-            self.lora_unet = inject_lora_into_model(self.unet, rank=self.rank, alpha=self.alpha)
-            self.lora_text = inject_lora_into_model(self.text_encoder, rank=self.rank, alpha=self.alpha)
+        self.ti_manager = MultiTokenTIManager(
+            tokenizer=self.tokenizer,
+            text_encoder=self.text_encoder,
+            device=str(self.device),
+        )
 
-            # 3. Khởi tạo Optimizer AdamW với learning rate riêng
-            trainable_params = [
-                {"params": [p for l in self.lora_unet.values() for p in l.parameters()], "lr": self.lr_unet, "weight_decay": 1e-2},
-                {"params": [p for l in self.lora_text.values() for p in l.parameters()], "lr": self.lr_text_encoder, "weight_decay": 1e-2},
-                {"params": self.ti_manager.get_trainable_params(), "lr": self.lr_ti, "weight_decay": 0.0},
-            ]
-            self.optimizer = torch.optim.AdamW(trainable_params)
-            self.is_initialized = True
+        self.lora_unet = inject_lora_into_model(self.unet, rank=self.rank, alpha=self.alpha)
+        self.lora_text = inject_lora_into_model(self.text_encoder, rank=self.rank, alpha=self.alpha)
 
-        except ImportError:
-            logger.warning("[LoRA Trainer] Chưa cài đặt 'diffusers'. Chạy ở chế độ dry-run / setup.")
-            self.is_initialized = False
+        trainable_params = [
+            {
+                "params": [p for layer in self.lora_unet.values() for p in layer.parameters()],
+                "lr": self.lr_unet,
+                "weight_decay": 1e-2,
+            },
+            {
+                "params": [p for layer in self.lora_text.values() for p in layer.parameters()],
+                "lr": self.lr_text_encoder,
+                "weight_decay": 1e-2,
+            },
+            {
+                "params": self.ti_manager.get_trainable_params(),
+                "lr": self.lr_ti,
+                "weight_decay": 0.0,
+            },
+        ]
+        self.optimizer = torch.optim.AdamW(trainable_params)
+        self.is_initialized = True
+
+    def _save_checkpoint(self, epoch: int, target_epochs: int, complete: bool) -> Path:
+        """Lưu checkpoint sau mỗi epoch để Kaggle commit có thể resume."""
+        ckpt_dir = self.output_dir / f"epoch_{epoch:03d}"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        lora_state = {
+            "config": {
+                "model_id": self.model_id,
+                "rank": int(self.rank),
+                "alpha": float(self.alpha),
+            },
+            "unet_lora": {k: v.state_dict() for k, v in self.lora_unet.items()},
+            "text_lora": {k: v.state_dict() for k, v in self.lora_text.items()},
+        }
+        torch.save(lora_state, ckpt_dir / "pytorch_lora_weights.pt")
+        self.ti_manager.save(ckpt_dir / "ti_embeddings.pt")
+        torch.save(self.optimizer.state_dict(), ckpt_dir / "optimizer.pt")
+        if self.use_amp:
+            torch.save(self.scaler.state_dict(), ckpt_dir / "scaler.pt")
+
+        state = {
+            "format": 1,
+            "model_id": self.model_id,
+            "rank": int(self.rank),
+            "alpha": float(self.alpha),
+            "completed_epochs": int(epoch),
+            "target_epochs": int(target_epochs),
+            "complete": bool(complete),
+        }
+        (self.output_dir / "training_state.json").write_text(
+            json.dumps(state, indent=2), encoding="utf-8"
+        )
+        return ckpt_dir
 
     def train(
         self,
         data_json: str | Path = "data/train_metadata.json",
         epochs: int = 10,
         batch_size: int = 32,
+        start_epoch: int = 0,
     ) -> str:
+        """Vòng lặp huấn luyện LoRA + TI với VAE pre-encoding cache.
+
+        start_epoch > 0 dùng để resume từ checkpoint epoch đã lưu. Điều này cần
+        cho Kaggle Save & Run All: nếu session bị timeout, lần chạy sau có thể
+        tiếp tục thay vì train lại từ đầu.
         """
-        Vòng lặp huấn luyện chính thức chuẩn bài báo (tích hợp FP16 và VAE pre-encoding cache).
-        """
+        if epochs <= 0:
+            raise ValueError("epochs phải > 0.")
+        start_epoch = max(0, min(int(start_epoch), int(epochs)))
+        grad_accum_steps = max(1, int(batch_size))
+
         logger.info("=" * 60)
         logger.info("[LoRA Inpaint Trainer] Khởi chạy huấn luyện Dual-Loss LoRA:")
         logger.info(f"  Model ID:     {self.model_id}")
         logger.info(f"  LoRA Config:  rank={self.rank}, alpha={self.alpha}")
-        logger.info(f"  Epochs:       {epochs}, Batch size: {batch_size}")
+        logger.info(
+            f"  Epochs:       {epochs} (start={start_epoch}), "
+            f"Grad accumulation: {grad_accum_steps}"
+        )
         logger.info(f"  LR U-Net:     {self.lr_unet}, LR Text: {self.lr_text_encoder}, LR TI: {self.lr_ti}")
-        logger.info(f"  Device:       {self.device} (Mixed Precision AMP: {self.use_amp})")
+        logger.info(f"  Device:       {self.device} (AMP: {self.use_amp})")
         logger.info("=" * 60)
 
         data_path = Path(data_json)
@@ -554,23 +651,48 @@ class LoRAInpaintTrainer:
             raise FileNotFoundError(f"Không tìm thấy file metadata: {data_path}")
 
         dataset = PCBLoRADataset(metadata_path=data_path, image_size=512)
-        dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
-
-        ckpt_dir = self.output_dir / f"epoch_{epochs:03d}"
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0)
 
         self._init_models()
-        if not getattr(self, "is_initialized", False):
-            logger.info("Môi trường chưa cài thư viện 'diffusers' để huấn luyện GPU thực tế.")
-            logger.info(f"Setup kiến trúc mã nguồn hoàn tất. Checkpoint dự kiến lưu tại: {ckpt_dir}")
-            return str(ckpt_dir)
 
-        # ── MỤC 2: TIỀN MÃ HÓA BỘ NHỚ ĐỆM VAE LATENTS (PRE-ENCODE CACHE) ────
-        # 668 ảnh chỉ tốn ~22MB RAM, tránh việc VAE phải encode lặp lại mỗi epoch
-        logger.info("[LoRA Trainer] Đang tiền mã hóa VAE Latents (Pre-encode cache 668 ảnh)...")
-        cached_latents = {}
-        cached_mask_lat_def = {}
-        cached_masked_lat_def = {}
+        if start_epoch > 0:
+            resume_dir = self.output_dir / f"epoch_{start_epoch:03d}"
+            if not (resume_dir / "pytorch_lora_weights.pt").exists() or not (
+                resume_dir / "ti_embeddings.pt"
+            ).exists():
+                raise FileNotFoundError(f"Thiếu checkpoint để resume: {resume_dir}")
+            lora_state = torch.load(
+                resume_dir / "pytorch_lora_weights.pt",
+                map_location=self.device,
+            )
+            for key, layer in self.lora_unet.items():
+                if key in lora_state.get("unet_lora", {}):
+                    layer.load_state_dict(lora_state["unet_lora"][key])
+            for key, layer in self.lora_text.items():
+                if key in lora_state.get("text_lora", {}):
+                    layer.load_state_dict(lora_state["text_lora"][key])
+            self.ti_manager.load(resume_dir / "ti_embeddings.pt")
+            optimizer_path = resume_dir / "optimizer.pt"
+            if optimizer_path.exists():
+                self.optimizer.load_state_dict(
+                    torch.load(optimizer_path, map_location=self.device)
+                )
+            scaler_path = resume_dir / "scaler.pt"
+            if self.use_amp and scaler_path.exists():
+                self.scaler.load_state_dict(
+                    torch.load(scaler_path, map_location=self.device)
+                )
+            logger.info(f"[LoRA Trainer] Resume từ {resume_dir}")
+
+        if start_epoch >= epochs:
+            logger.info(f"[LoRA Trainer] Đã đủ {epochs} epoch; không train thêm.")
+            return str(self.output_dir / f"epoch_{epochs:03d}")
+
+        # ── Pre-encode VAE latents ────────────────────────────────────────
+        logger.info(f"[LoRA Trainer] Pre-encoding {len(dataset)} VAE latents...")
+        cached_latents: Dict[int, torch.Tensor] = {}
+        cached_mask_lat_def: Dict[int, torch.Tensor] = {}
+        cached_masked_lat_def: Dict[int, torch.Tensor] = {}
 
         with torch.no_grad():
             for idx in tqdm(range(len(dataset)), desc="Pre-encoding VAE Latents", leave=False):
@@ -579,100 +701,97 @@ class LoRAInpaintTrainer:
                 msk_t = sample["mask"].unsqueeze(0).to(self.device)
 
                 with torch.cuda.amp.autocast(enabled=self.use_amp):
-                    lat = self.vae.encode(img_t).latent_dist.sample() * 0.18215
+                    lat = self.vae.encode(img_t).latent_dist.sample() * self.vae_scaling
                     lh, lw = lat.shape[-2:]
                     m_lat = F.interpolate(msk_t, size=(lh, lw), mode="nearest")
                     m_img = img_t * (1.0 - msk_t)
-                    m_lat_img = self.vae.encode(m_img).latent_dist.sample() * 0.18215
+                    m_lat_img = self.vae.encode(m_img).latent_dist.sample() * self.vae_scaling
 
-                cached_latents[idx] = lat.cpu()
-                cached_mask_lat_def[idx] = m_lat.cpu()
-                cached_masked_lat_def[idx] = m_lat_img.cpu()
+                cached_latents[idx] = lat.cpu().float()
+                cached_mask_lat_def[idx] = m_lat.cpu().float()
+                cached_masked_lat_def[idx] = m_lat_img.cpu().float()
 
-        logger.info(f"[LoRA Trainer] Đã cache thành công {len(cached_latents)} VAE latents vào RAM (Mục 2)!")
-        if self.use_amp:
-            logger.info("[LoRA Trainer] Đã kích hoạt Mixed Precision (FP16 / AMP) cho U-Net & Text Encoder (Mục 1)!")
+        logger.info(f"[LoRA Trainer] Đã cache {len(cached_latents)} VAE latents.")
 
-        # ── VÒNG LẶP HUẤN LUYỆN DIFFUSION THỰC TẾ ─────────────────────────
         self.unet.train()
         self.text_encoder.train()
 
-        for epoch in range(1, epochs + 1):
+        for epoch in range(start_epoch + 1, epochs + 1):
             epoch_loss = 0.0
             accum_steps = 0
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
-            pbar_loader = tqdm(dataloader, desc=f"Epoch [{epoch}/{epochs}] [LoRA Dual-Loss]", leave=False, unit="mẫu")
-            for step, batch in enumerate(pbar_loader):
-                sample_idx = batch["index"][0].item() if "index" in batch else None
-                images = batch["image"].to(self.device)   # (1, 3, 512, 512)
-                masks = batch["mask"].to(self.device)     # (1, 1, 512, 512)
+            pbar = tqdm(
+                dataloader,
+                desc=f"Epoch [{epoch}/{epochs}] [LoRA Dual-Loss]",
+                leave=False,
+                unit="ảnh",
+            )
+            for step, batch in enumerate(pbar):
+                sample_idx = int(batch["index"][0].item())
+                images = batch["image"].to(self.device)
+                masks = batch["mask"].to(self.device)
                 defect_type = batch["defect_type"][0]
 
-                # 1. Mã hóa ảnh qua VAE để lấy latent z0 (Lấy từ RAM cache Mục 2)
-                if sample_idx is not None and sample_idx in cached_latents:
-                    latents = cached_latents[sample_idx].to(self.device)
-                else:
-                    with torch.no_grad():
-                        with torch.cuda.amp.autocast(enabled=self.use_amp):
-                            latents = self.vae.encode(images).latent_dist.sample() * 0.18215
+                # 1. Latent z0 từ cache
+                latents = cached_latents[sample_idx].to(self.device, dtype=self.unet.dtype)
                 latent_h, latent_w = latents.shape[-2:]
 
-                # 2. Lấy mẫu bước thời gian t và cộng nhiễu Gaussian
+                # 2. Timestep + noise
                 timesteps = torch.randint(
-                    0, self.noise_scheduler.config.num_train_timesteps, (latents.shape[0],),
-                    device=self.device, dtype=torch.long
+                    0,
+                    self.noise_scheduler.config.num_train_timesteps,
+                    (latents.shape[0],),
+                    device=self.device,
+                    dtype=torch.long,
                 )
                 noise = torch.randn_like(latents)
                 noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # 3. Mã hóa prompt P và prompt P'
+                # 3. Prompt P và P'
                 prompt_def = self.ti_manager.get_defect_prompt(defect_type)
                 prompt_rec = self.ti_manager.get_normal_prompt()
 
-                tokens_def = self.tokenizer(prompt_def, padding="max_length", max_length=77, return_tensors="pt").input_ids.to(self.device)
-                tokens_rec = self.tokenizer(prompt_rec, padding="max_length", max_length=77, return_tensors="pt").input_ids.to(self.device)
+                tokens_def = self.tokenizer(
+                    prompt_def, padding="max_length", max_length=77, return_tensors="pt"
+                ).input_ids.to(self.device)
+                tokens_rec = self.tokenizer(
+                    prompt_rec, padding="max_length", max_length=77, return_tensors="pt"
+                ).input_ids.to(self.device)
 
                 with torch.cuda.amp.autocast(enabled=self.use_amp):
                     text_emb_def = self.text_encoder(tokens_def)[0]
                     text_emb_rec = self.text_encoder(tokens_rec)[0]
 
-                # 4. Lấy mẫu bounding box B' từ vùng không lỗi (Equation 7)
-                rec_masks = self.loss_fn.sample_negative_mask(masks)
+                # 4. B' cho reconstruction loss
+                rec_masks = self.loss_fn.sample_negative_mask(masks).to(self.device)
 
-                # ── XỬ LÝ 9 KÊNH ĐẦU VÀO CHO INPAINTING U-NET ──────────────────
-                # runwayml/stable-diffusion-inpainting nhận 9 channels:
-                # [noisy_latents (4), mask_lat (1), masked_image_latents (4)]
-                in_channels = getattr(self.unet.config, "in_channels", 9)
+                # 5. 9-channel inpainting input
+                in_channels = int(getattr(self.unet.config, "in_channels", 9))
                 if in_channels == 9:
-                    with torch.no_grad():
-                        # Nhánh Defect (mask B) - Lấy từ RAM cache Mục 2:
-                        if sample_idx is not None and sample_idx in cached_mask_lat_def:
-                            mask_lat_def = cached_mask_lat_def[sample_idx].to(self.device)
-                            masked_lat_def = cached_masked_lat_def[sample_idx].to(self.device)
-                        else:
-                            mask_lat_def = F.interpolate(masks, size=(latent_h, latent_w), mode="nearest")
-                            masked_img_def = images * (1.0 - masks)
-                            with torch.cuda.amp.autocast(enabled=self.use_amp):
-                                masked_lat_def = self.vae.encode(masked_img_def).latent_dist.sample() * 0.18215
-                        unet_input_def = torch.cat([noisy_latents, mask_lat_def, masked_lat_def], dim=1)
+                    mask_lat_def = cached_mask_lat_def[sample_idx].to(self.device, dtype=self.unet.dtype)
+                    masked_lat_def = cached_masked_lat_def[sample_idx].to(self.device, dtype=self.unet.dtype)
+                    unet_input_def = torch.cat([noisy_latents, mask_lat_def, masked_lat_def], dim=1)
 
-                        # Nhánh Reconstruction (mask B' ngẫu nhiên mỗi step):
-                        mask_lat_rec = F.interpolate(rec_masks, size=(latent_h, latent_w), mode="nearest")
-                        masked_img_rec = images * (1.0 - rec_masks)
+                    mask_lat_rec = F.interpolate(rec_masks, size=(latent_h, latent_w), mode="nearest")
+                    masked_img_rec = images * (1.0 - rec_masks)
+                    with torch.no_grad():
                         with torch.cuda.amp.autocast(enabled=self.use_amp):
-                            masked_lat_rec = self.vae.encode(masked_img_rec).latent_dist.sample() * 0.18215
-                        unet_input_rec = torch.cat([noisy_latents, mask_lat_rec, masked_lat_rec], dim=1)
+                            masked_lat_rec = self.vae.encode(masked_img_rec).latent_dist.sample() * self.vae_scaling
+                    unet_input_rec = torch.cat([noisy_latents, mask_lat_rec, masked_lat_rec], dim=1)
                 else:
                     unet_input_def = noisy_latents
                     unet_input_rec = noisy_latents
 
-                # 5. U-Net dự đoán nhiễu cho cả 2 nhánh (AMP FP16 Mục 1)
+                # 6. U-Net dự đoán nhiễu cho 2 nhánh
                 with torch.cuda.amp.autocast(enabled=self.use_amp):
-                    noise_pred_def = self.unet(unet_input_def, timesteps, encoder_hidden_states=text_emb_def).sample
-                    noise_pred_rec = self.unet(unet_input_rec, timesteps, encoder_hidden_states=text_emb_rec).sample
+                    noise_pred_def = self.unet(
+                        unet_input_def, timesteps, encoder_hidden_states=text_emb_def
+                    ).sample
+                    noise_pred_rec = self.unet(
+                        unet_input_rec, timesteps, encoder_hidden_states=text_emb_rec
+                    ).sample
 
-                    # 6. Tính toán Dual Loss (L_tot = L_def + 0.1 * L_rec)
                     loss, l_def, l_rec = self.loss_fn(
                         noise_pred_def=noise_pred_def,
                         noise_target=noise,
@@ -680,28 +799,33 @@ class LoRAInpaintTrainer:
                         noise_pred_rec=noise_pred_rec,
                         rec_mask=rec_masks,
                     )
+                    scaled_loss = loss / grad_accum_steps
 
-                    # 7. Chia tỷ lệ loss cho batch_size và tích lũy gradient
-                    scaled_loss = loss / batch_size
-
+                # 7. Backward + gradient accumulation
                 if self.use_amp:
                     self.scaler.scale(scaled_loss).backward()
                 else:
                     scaled_loss.backward()
 
                 accum_steps += 1
-                epoch_loss += loss.item()
-                pbar_loader.set_postfix({"loss": f"{loss.item():.4f}", "l_def": f"{l_def.item():.4f}", "l_rec": f"{l_rec.item():.4f}"})
+                epoch_loss += float(loss.item())
+                pbar.set_postfix({
+                    "loss": f"{loss.item():.4f}",
+                    "l_def": f"{l_def.item():.4f}",
+                    "l_rec": f"{l_rec.item():.4f}",
+                })
 
-                if accum_steps % batch_size == 0 or step == len(dataloader) - 1:
+                if accum_steps % grad_accum_steps == 0 or step == len(dataloader) - 1:
                     if self.use_amp:
                         self.scaler.unscale_(self.optimizer)
 
-                    # Triệt tiêu gradient token thường của CLIP, bảo toàn 6 token TI
                     self.ti_manager.zero_non_placeholder_grads()
 
-                    torch.nn.utils.clip_grad_norm_(self.unet.parameters(), max_norm=1.0)
-                    torch.nn.utils.clip_grad_norm_(self.text_encoder.parameters(), max_norm=1.0)
+                    trainable = [
+                        p for group in self.optimizer.param_groups
+                        for p in group["params"] if p.requires_grad
+                    ]
+                    torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
 
                     if self.use_amp:
                         self.scaler.step(self.optimizer)
@@ -709,38 +833,35 @@ class LoRAInpaintTrainer:
                     else:
                         self.optimizer.step()
 
-                    # Khôi phục token vocab gốc nếu bị ảnh hưởng và reset gradient
                     self.ti_manager.restore_non_placeholder_embeddings()
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
 
             avg_loss = epoch_loss / max(1, len(dataloader))
             logger.info(f"Epoch [{epoch}/{epochs}] Dual Loss: {avg_loss:.4f}")
 
-        # Lưu Checkpoints (LoRA weights & TI embeddings)
-        lora_state = {
-            "unet_lora": {k: v.state_dict() for k, v in self.lora_unet.items()},
-            "text_lora": {k: v.state_dict() for k, v in self.lora_text.items()},
-        }
-        torch.save(lora_state, ckpt_dir / "pytorch_lora_weights.pt")
-        self.ti_manager.save(ckpt_dir / "ti_embeddings.pt")
+            # Lưu sau MỖI epoch để lần chạy Kaggle sau có thể resume.
+            ckpt_dir = self._save_checkpoint(
+                epoch, epochs, complete=(epoch == epochs)
+            )
+            logger.info(f"[LoRA Trainer] Đã lưu checkpoint: {ckpt_dir}")
 
-        logger.info(f"Hoàn tất huấn luyện LoRA! Đã lưu tại: {ckpt_dir}")
-        return str(ckpt_dir)
+        final_dir = self.output_dir / f"epoch_{epochs:03d}"
+        logger.info(f"Hoàn tất huấn luyện LoRA! Đã lưu tại: {final_dir}")
+        return str(final_dir)
 
 
 # ─────────────────────────────────────────────────────────
-# 6. Inpainting Generator với Cơ chế Latent Overwriting
+# 6. Inpainting Generator: DDIM + consistent latent overwriting
 # ─────────────────────────────────────────────────────────
 
 class PCBDefectInpainter:
     """
-    Module sinh ảnh lỗi PCB bằng Inpainting Diffusion:
-    - 50 Denoising steps (DDIM Scheduler)
-    - Prompt P kết hợp Multi-token Textual Inversion
-    - Negative prompt chuẩn bài báo
-    - Latent overwriting (Trang 5 bài báo) tại mỗi bước khử nhiễu:
-        z_{t-1} = B_lat ⊙ z_{t-1, gen} + (1 - B_lat) ⊙ z_{t-1, orig}
-      bảo toàn 100% bối cảnh bo mạch gốc.
+    Sinh ảnh lỗi PCB bằng inpainting diffusion.
+
+    Latent Overwriting (RePaint/DDIM):
+        z_{t-1} = B_lat * z_{t-1,gen} + (1 - B_lat) * q(z0, t-1)
+    với q(z0, t-1) dùng CÙNG một noise_bg cho mọi timestep, không phải
+    torch.randn_like() mới ở từng bước.
     """
 
     def __init__(
@@ -748,91 +869,250 @@ class PCBDefectInpainter:
         model_id: str = "runwayml/stable-diffusion-inpainting",
         lora_ckpt: Optional[str] = None,
         ti_ckpt: Optional[str] = None,
+        lora_rank: int = 8,
+        lora_alpha: float = 16.0,
         device: str = "cuda",
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
         negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
+        max_side: int = 768,
+        feather_sigma: float = 2.5,
+        attention_slicing: bool = True,
+        allow_fallback: bool = False,
     ):
         self.model_id = model_id
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.lora_ckpt = lora_ckpt
-        self.ti_ckpt = ti_ckpt
-        self.num_inference_steps = num_inference_steps
-        self.guidance_scale = guidance_scale
+        self.lora_ckpt = str(lora_ckpt) if lora_ckpt else None
+        self.ti_ckpt = str(ti_ckpt) if ti_ckpt else None
+        self.lora_rank = int(lora_rank)
+        self.lora_alpha = float(lora_alpha)
+        self.num_inference_steps = int(num_inference_steps)
+        self.guidance_scale = float(guidance_scale)
         self.negative_prompt = negative_prompt
+        self.max_side = int(max_side)
+        self.feather_sigma = float(feather_sigma)
+        self.attention_slicing = bool(attention_slicing)
+        self.allow_fallback = bool(allow_fallback)
+        self.ti_loaded = False
+        self.using_lora = False
+        self._last_info: Dict = {}
 
         self._load_pipeline()
 
+    def _resolve_checkpoint(self, ckpt: Optional[str], default_name: str) -> Optional[Path]:
+        if not ckpt:
+            return None
+        p = Path(ckpt)
+        if p.is_dir():
+            p = p / default_name
+        return p
+
     def _load_pipeline(self):
-        """Khởi tạo pipeline và nạp các checkpoint LoRA + Textual Inversion nếu có."""
         try:
             from diffusers import StableDiffusionInpaintPipeline, DDIMScheduler
-            dtype = torch.float16 if self.device.type == "cuda" else torch.float32
-            logger.info(f"[Inpainter] Đang tải Inpainting Pipeline ({dtype}): {self.model_id}...")
-            pipe = StableDiffusionInpaintPipeline.from_pretrained(
-                self.model_id,
-                torch_dtype=dtype,
-            ).to(self.device)
-
-            pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-            self.pipe = pipe
-            self.vae = pipe.vae
-            self.unet = pipe.unet
-            self.text_encoder = pipe.text_encoder
-            self.tokenizer = pipe.tokenizer
-            self.scheduler = pipe.scheduler
-
-            # 1. Gắn cấu trúc LoRA vào U-Net và Text Encoder
-            self.lora_unet = inject_lora_into_model(self.unet, rank=8, alpha=16)
-            self.lora_text = inject_lora_into_model(self.text_encoder, rank=8, alpha=16)
-
-            # 2. Nạp trọng số LoRA nếu lora_ckpt được cung cấp
-            if self.lora_ckpt:
-                lora_path = Path(self.lora_ckpt)
-                if lora_path.is_dir():
-                    lora_path = lora_path / "pytorch_lora_weights.pt"
-                if lora_path.exists():
-                    logger.info(f"[Inpainter] Đang nạp trọng số LoRA từ: {lora_path}...")
-                    lora_state = torch.load(lora_path, map_location=self.device)
-                    if "unet_lora" in lora_state:
-                        loaded_u = 0
-                        for k, state in lora_state["unet_lora"].items():
-                            if k in self.lora_unet:
-                                self.lora_unet[k].load_state_dict(state)
-                                loaded_u += 1
-                        logger.info(f"[Inpainter] Đã nạp LoRA U-Net: {loaded_u}/{len(self.lora_unet)} modules.")
-                    if "text_lora" in lora_state:
-                        loaded_t = 0
-                        for k, state in lora_state["text_lora"].items():
-                            if k in self.lora_text:
-                                self.lora_text[k].load_state_dict(state)
-                                loaded_t += 1
-                        logger.info(f"[Inpainter] Đã nạp LoRA Text Encoder: {loaded_t}/{len(self.lora_text)} modules.")
-                    logger.info("[Inpainter] Đã nạp thành công toàn bộ trọng số LoRA vào U-Net & Text Encoder!")
-                else:
-                    logger.warning(f"[Inpainter] Không tìm thấy checkpoint LoRA tại {lora_path}. Sẽ sử dụng base model.")
-
-            self.unet.eval()
-            self.text_encoder.eval()
-
-            # 3. Khởi tạo & nạp Textual Inversion
-            self.ti_manager = MultiTokenTIManager(
-                tokenizer=self.tokenizer,
-                text_encoder=self.text_encoder,
-                device=str(self.device),
-            )
-            if self.ti_ckpt:
-                ti_path = Path(self.ti_ckpt)
-                if ti_path.is_dir():
-                    ti_path = ti_path / "ti_embeddings.pt"
-                if ti_path.exists():
-                    self.ti_manager.load(ti_path)
-
-            self.has_diffusion = True
-        except ImportError:
-            logger.warning("[Inpainter] 'diffusers' chưa được cài đặt. Khởi tạo chế độ cấu hình kiến trúc.")
+        except ImportError as e:
+            if not self.allow_fallback:
+                raise RuntimeError(
+                    "Chưa cài đặt 'diffusers'. Không thể sinh ảnh inpainting thật.\n"
+                    "Cài đặt: pip install 'diffusers>=0.25.0' 'transformers>=4.37.0' accelerate\n"
+                    "Nếu chỉ muốn chạy fallback mô phỏng để test pipeline, hãy đặt "
+                    "allow_fallback=True (kết quả KHÔNG phải diffusion thật).\n"
+                    f"Chi tiết: {e}"
+                ) from e
+            logger.warning("[Inpainter] Thiếu diffusers; dùng fallback mô phỏng vì allow_fallback=True.")
             self.has_diffusion = False
             self.ti_manager = MultiTokenTIManager(device=str(self.device))
+            return
+
+        dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        logger.info(f"[Inpainter] Đang tải Inpainting Pipeline ({dtype}): {self.model_id}...")
+        try:
+            load_kwargs = {
+                "torch_dtype": dtype,
+                "safety_checker": None,
+                "use_safetensors": True,
+            }
+            if dtype == torch.float16:
+                load_kwargs["variant"] = "fp16"
+            pipe = StableDiffusionInpaintPipeline.from_pretrained(
+                self.model_id,
+                **load_kwargs,
+            ).to(self.device)
+        except Exception as e:
+            raise RuntimeError(
+                f"Không tải được inpainting model '{self.model_id}'. "
+                "Kiểm tra mạng/cache Hugging Face và dung lượng VRAM.\n"
+                f"Chi tiết: {e}"
+            ) from e
+
+        pipe.scheduler = DDIMScheduler.from_config(
+            pipe.scheduler.config,
+            clip_sample=False,
+            set_alpha_to_one=False,
+        )
+        if self.attention_slicing:
+            try:
+                pipe.enable_attention_slicing()
+            except Exception:
+                pass
+            try:
+                pipe.enable_vae_slicing()
+            except Exception:
+                pass
+
+        self.pipe = pipe
+        self.vae = pipe.vae
+        self.unet = pipe.unet
+        self.text_encoder = pipe.text_encoder
+        self.tokenizer = pipe.tokenizer
+        self.scheduler = pipe.scheduler
+        self.vae_scaling = float(getattr(self.vae.config, "scaling_factor", 0.18215))
+
+        # 1. Đọc checkpoint trước để lấy đúng rank/alpha đã dùng lúc train.
+        # Nếu checkpoint cũ không có config, suy ra rank từ shape lora_A.
+        lora_state = None
+        lora_path = self._resolve_checkpoint(self.lora_ckpt, "pytorch_lora_weights.pt")
+        if self.lora_ckpt:
+            if lora_path is None or not lora_path.exists():
+                raise FileNotFoundError(
+                    f"Không tìm thấy LoRA checkpoint: {lora_path}. "
+                    "Hãy chạy 'python run_pipeline.py step2_train ...' trước."
+                )
+            lora_state = torch.load(lora_path, map_location=self.device)
+            cfg = lora_state.get("config", {}) if isinstance(lora_state, dict) else {}
+            if cfg.get("rank") is not None:
+                self.lora_rank = int(cfg["rank"])
+            elif isinstance(lora_state, dict) and lora_state.get("unet_lora"):
+                first_state = next(iter(lora_state["unet_lora"].values()))
+                if "lora_A" in first_state:
+                    self.lora_rank = int(first_state["lora_A"].shape[0])
+            if cfg.get("alpha") is not None:
+                self.lora_alpha = float(cfg["alpha"])
+            logger.info(
+                f"[Inpainter] LoRA checkpoint rank={self.lora_rank}, "
+                f"alpha={self.lora_alpha}"
+            )
+
+        # 2. Gắn cấu trúc LoRA (phải cùng rank/alpha với lúc train)
+        self.lora_unet = inject_lora_into_model(
+            self.unet, rank=self.lora_rank, alpha=self.lora_alpha
+        )
+        self.lora_text = inject_lora_into_model(
+            self.text_encoder, rank=self.lora_rank, alpha=self.lora_alpha
+        )
+
+        # 3. Nạp trọng số LoRA.
+        if lora_state is not None:
+            logger.info(f"[Inpainter] Nạp LoRA từ {lora_path}...")
+            if "unet_lora" in lora_state:
+                loaded = 0
+                for k, state in lora_state["unet_lora"].items():
+                    if k in self.lora_unet:
+                        self.lora_unet[k].load_state_dict(state)
+                        loaded += 1
+                if loaded != len(self.lora_unet):
+                    raise RuntimeError(
+                        f"LoRA U-Net chỉ nạp {loaded}/{len(self.lora_unet)} modules. "
+                        "Checkpoint không khớp kiến trúc."
+                    )
+                logger.info(f"[Inpainter] LoRA U-Net: {loaded}/{len(self.lora_unet)} modules.")
+            if "text_lora" in lora_state:
+                loaded = 0
+                for k, state in lora_state["text_lora"].items():
+                    if k in self.lora_text:
+                        self.lora_text[k].load_state_dict(state)
+                        loaded += 1
+                if loaded != len(self.lora_text):
+                    raise RuntimeError(
+                        f"LoRA Text Encoder chỉ nạp {loaded}/{len(self.lora_text)} modules. "
+                        "Checkpoint không khớp kiến trúc."
+                    )
+                logger.info(f"[Inpainter] LoRA Text Encoder: {loaded}/{len(self.lora_text)} modules.")
+            self.using_lora = True
+        else:
+            logger.warning(
+                "[Inpainter] Không có lora_ckpt: đang dùng base model. "
+                "Kết quả sẽ KHÔNG đại diện cho cấu hình LoRA của bài báo."
+            )
+
+        self.unet.eval()
+        self.text_encoder.eval()
+
+        # 3. Textual Inversion
+        self.ti_manager = MultiTokenTIManager(
+            tokenizer=self.tokenizer,
+            text_encoder=self.text_encoder,
+            device=str(self.device),
+        )
+        ti_path = self._resolve_checkpoint(self.ti_ckpt, "ti_embeddings.pt")
+        if self.ti_ckpt:
+            if ti_path is None or not ti_path.exists():
+                raise FileNotFoundError(
+                    f"Không tìm thấy TI checkpoint: {ti_path}. "
+                    "Hãy chạy 'python run_pipeline.py step2_train ...' trước."
+                )
+            self.ti_manager.load(ti_path)
+            self.ti_loaded = True
+        else:
+            logger.warning(
+                "[Inpainter] Không có ti_ckpt: dùng prompt từ ngữ tự nhiên thay vì token TI đã học."
+            )
+            self.ti_manager.placeholder_tokens = {
+                c: c.replace("_", " ") for c in PCB_DEFECT_CLASSES
+            }
+
+        self.has_diffusion = True
+
+    @torch.no_grad()
+    def _encode_image(self, img_tensor: torch.Tensor) -> torch.Tensor:
+        return self.vae.encode(img_tensor).latent_dist.sample() * self.vae_scaling
+
+    def _work_size(self, width: int, height: int) -> Tuple[int, int]:
+        """
+        Chọn kích thước làm việc:
+          - bội số của 8 (VAE);
+          - gần native nhất có thể, tối đa max_side;
+          - tối thiểu 256 để UNet ổn định.
+        Với ảnh 600x600, kết quả là 600x600 (không resize).
+        """
+        scale = min(1.0, self.max_side / float(max(width, height)))
+        work_w = max(256, int(round(width * scale / 8.0)) * 8)
+        work_h = max(256, int(round(height * scale / 8.0)) * 8)
+        work_w = min(work_w, self.max_side)
+        work_h = min(work_h, self.max_side)
+        return work_w, work_h
+
+    @staticmethod
+    def _feather_alpha(mask: np.ndarray, sigma: float, expand_px: int = 4) -> np.ndarray:
+        """
+        Tạo alpha mềm từ mask nhị phân:
+          - Gaussian blur sigma 2-3 px;
+          - chỉ giữ alpha trong vùng mask được dilate expand_px;
+          - ngoài vùng đó alpha = 0 => pixel gốc được giữ nguyên tuyệt đối.
+        """
+        binary = (mask > 127).astype(np.float32)
+        if binary.max() <= 0:
+            return binary
+
+        if sigma > 0:
+            alpha = cv2.GaussianBlur(binary, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        else:
+            alpha = binary
+
+        k = max(1, int(expand_px) * 2 + 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        expanded = cv2.dilate(binary, kernel, iterations=1)
+        alpha = np.clip(alpha * expanded, 0.0, 1.0)
+
+        # Giữ tâm mask gần như chắc chắn 1.0 để lỗi không bị pha loãng.
+        alpha = np.maximum(alpha, cv2.erode(binary, np.ones((3, 3), np.uint8)) * 0.98)
+        return alpha.astype(np.float32)
+
+    @staticmethod
+    def _composite(original: np.ndarray, generated: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+        a = alpha[..., None]
+        out = generated.astype(np.float32) * a + original.astype(np.float32) * (1.0 - a)
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     @torch.no_grad()
     def generate(
@@ -841,117 +1121,186 @@ class PCBDefectInpainter:
         defect_mask: Union[Image.Image, np.ndarray, str],
         defect_type: str,
     ) -> Image.Image:
-        """
-        Quy trình Denoising 50 bước với cơ chế LATENT OVERWRITING theo chuẩn bài báo.
-        """
+        """Sinh một ảnh lỗi, giữ nguyên pixel ngoài vùng mask."""
         if isinstance(normal_image, (str, Path)):
             normal_image = Image.open(normal_image).convert("RGB")
         elif isinstance(normal_image, np.ndarray):
-            normal_image = Image.fromarray(normal_image)
+            normal_image = Image.fromarray(normal_image).convert("RGB")
+        else:
+            normal_image = normal_image.convert("RGB")
 
         if isinstance(defect_mask, (str, Path)):
             defect_mask = Image.open(defect_mask).convert("L")
         elif isinstance(defect_mask, np.ndarray):
-            defect_mask = Image.fromarray(defect_mask)
+            defect_mask = Image.fromarray(defect_mask).convert("L")
+        else:
+            defect_mask = defect_mask.convert("L")
 
         orig_w, orig_h = normal_image.size
-        target_size = (512, 512)
+        mask_np_orig = np.array(defect_mask, dtype=np.uint8)
+        if not np.any(mask_np_orig > 127):
+            logger.warning("[Inpainter] Mask rỗng; trả lại ảnh gốc.")
+            self._last_info = {"generation_mode": "no_mask", "work_size": [orig_w, orig_h]}
+            return normal_image.copy()
 
-        # ── NẾU CÓ ĐẦY ĐỦ DIFFUSION & TRỌNG SỐ TRÊN GPU ──────────────────
         if getattr(self, "has_diffusion", False):
-            # 1. Tiền xử lý ảnh gốc và mask
-            img_resized = normal_image.resize(target_size)
-            msk_resized = defect_mask.resize(target_size)
+            work_w, work_h = self._work_size(orig_w, orig_h)
+            img_work = normal_image if (work_w, work_h) == (orig_w, orig_h) else normal_image.resize(
+                (work_w, work_h), Image.Resampling.LANCZOS
+            )
+            msk_work = defect_mask if (work_w, work_h) == (orig_w, orig_h) else defect_mask.resize(
+                (work_w, work_h), Image.Resampling.NEAREST
+            )
 
-            img_np = np.array(img_resized).astype(np.float32) / 127.5 - 1.0
-            msk_np = (np.array(msk_resized) > 128).astype(np.float32)
+            img_np = np.array(img_work).astype(np.float32) / 127.5 - 1.0
+            msk_np = (np.array(msk_work) > 127).astype(np.float32)
 
-            img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device=self.device, dtype=self.unet.dtype)  # (1, 3, H, W)
-            msk_tensor = torch.from_numpy(msk_np).unsqueeze(0).unsqueeze(0).to(device=self.device, dtype=self.unet.dtype)      # (1, 1, H, W)
+            img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(
+                device=self.device, dtype=self.unet.dtype
+            )
+            msk_tensor = torch.from_numpy(msk_np).unsqueeze(0).unsqueeze(0).to(
+                device=self.device, dtype=self.unet.dtype
+            )
 
-            # 2. Mã hóa ảnh gốc sang Latent z0_orig
-            z0_orig = self.vae.encode(img_tensor).latent_dist.sample() * 0.18215
+            # 1. Latent gốc
+            z0_orig = self._encode_image(img_tensor)
             latent_h, latent_w = z0_orig.shape[-2:]
-
-            # Mask ở không gian Latent B_lat
             b_lat = F.interpolate(msk_tensor, size=(latent_h, latent_w), mode="nearest")
+            b_lat = (b_lat > 0.5).to(z0_orig.dtype)
 
-            # Chuẩn bị masked image latents cho U-Net Inpainting 9 kênh
-            in_channels = getattr(self.unet.config, "in_channels", 9)
+            # 2. 9-channel conditioning
+            in_channels = int(getattr(self.unet.config, "in_channels", 9))
             if in_channels == 9:
                 masked_img = img_tensor * (1.0 - msk_tensor)
-                masked_img_latents = self.vae.encode(masked_img).latent_dist.sample() * 0.18215
+                masked_img_latents = self._encode_image(masked_img)
                 mask_input = torch.cat([b_lat] * 2)
                 masked_latents_input = torch.cat([masked_img_latents] * 2)
 
-            # 3. Chuẩn bị Text Embeddings (Prompt P và Negative Prompt)
+            # 3. Text embeddings (CFG)
             prompt = self.ti_manager.get_defect_prompt(defect_type)
-            tok_pos = self.tokenizer(prompt, padding="max_length", max_length=77, return_tensors="pt").input_ids.to(self.device)
-            tok_neg = self.tokenizer(self.negative_prompt, padding="max_length", max_length=77, return_tensors="pt").input_ids.to(self.device)
+            tok_pos = self.tokenizer(
+                prompt, padding="max_length", max_length=77, return_tensors="pt"
+            ).input_ids.to(self.device)
+            tok_neg = self.tokenizer(
+                self.negative_prompt, padding="max_length", max_length=77, return_tensors="pt"
+            ).input_ids.to(self.device)
 
             emb_pos = self.text_encoder(tok_pos)[0]
             emb_neg = self.text_encoder(tok_neg)[0]
-            text_embeddings = torch.cat([emb_neg, emb_pos])  # (2, 77, 768)
+            text_embeddings = torch.cat([emb_neg, emb_pos])
 
-            # 4. Khởi tạo nhiễu ngẫu nhiên z_T
+            # 4. Khởi tạo z_T và MỘT noise nền cố định cho toàn bộ quỹ đạo.
+            # Vùng lỗi bắt đầu từ Gaussian; vùng nền bắt đầu từ q(z0, T)
+            # dùng đúng noise_bg sẽ được dùng lại ở mọi bước overwrite.
             self.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
             timesteps = self.scheduler.timesteps
-            latents = torch.randn_like(z0_orig)
+            noise_bg = torch.randn_like(z0_orig)
+            z0_at_T = self.scheduler.add_noise(z0_orig, noise_bg, timesteps[0])
+            latents = b_lat * torch.randn_like(z0_orig) + (1.0 - b_lat) * z0_at_T
 
-            # 5. VÒNG LẶP KHỬ NHIỄU 50 BƯỚC + LATENT OVERWRITING
-            pbar_denoise = tqdm(timesteps, desc=f"Khử nhiễu ({defect_type})", leave=False, unit="step")
-            for i, t in enumerate(pbar_denoise):
+            pbar = tqdm(
+                timesteps,
+                desc=f"Khử nhiễu ({defect_type})",
+                leave=False,
+                unit="step",
+            )
+            for i, t in enumerate(pbar):
                 latent_model_input = torch.cat([latents] * 2)
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                # Nối ghép đủ 9 kênh nếu U-Net là inpainting model
                 if in_channels == 9:
-                    latent_model_input = torch.cat([latent_model_input, mask_input, masked_latents_input], dim=1)
+                    latent_model_input = torch.cat(
+                        [latent_model_input, mask_input, masked_latents_input], dim=1
+                    )
 
-                # U-Net dự đoán nhiễu với Classifier-Free Guidance
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                noise_pred = self.unet(
+                    latent_model_input, t, encoder_hidden_states=text_embeddings
+                ).sample
+                noise_uncond, noise_text = noise_pred.chunk(2)
+                noise_pred = noise_uncond + self.guidance_scale * (noise_text - noise_uncond)
 
-                # Tính latent bước trước z_{t-1}
-                latents_prev = self.scheduler.step(noise_pred, t, latents).prev_sample
+                latents_prev = self.scheduler.step(noise_pred, t, latents, eta=0.0).prev_sample
 
-                # ── CƠ CHẾ LATENT OVERWRITING CỐT LÕI (Trang 5 Paper) ──────
-                # "After each denoising process, the latent representation corresponding
-                # to the unmasked region (1 - B) is overwritten to preserve the background area."
+                # ── Latent Overwriting nhất quán ──────────────────────
+                # Dùng cùng noise_bg để tạo q(z0, prev_t). Không lấy mẫu
+                # Gaussian mới ở từng bước.
                 if i < len(timesteps) - 1:
                     prev_t = timesteps[i + 1]
-                    noise_bg = torch.randn_like(z0_orig)
-                    z_orig_t_prev = self.scheduler.add_noise(z0_orig, noise_bg, prev_t)
-                    # Gán đè vùng unmasked bằng latent gốc chứa nhiễu ở timestep prev_t
-                    latents = b_lat * latents_prev + (1.0 - b_lat) * z_orig_t_prev
+                    prev_t_tensor = torch.as_tensor(
+                        prev_t, device=self.device, dtype=torch.long
+                    )
+                    z0_prev = self.scheduler.add_noise(z0_orig, noise_bg, prev_t_tensor)
+                    latents = b_lat * latents_prev + (1.0 - b_lat) * z0_prev
                 else:
-                    # Bước cuối cùng: gán đè trực tiếp với latent sạch z0_orig
+                    # t = 0: vùng nền là latent sạch tuyệt đối.
                     latents = b_lat * latents_prev + (1.0 - b_lat) * z0_orig
 
-            # 6. Giải mã Latent về Pixel space qua VAE Decoder
-            decoded = self.vae.decode(latents / 0.18215).sample
-            decoded = (decoded / 2 + 0.5).clamp(0, 1)
-            decoded_np = (decoded.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            decoded_pil = Image.fromarray(decoded_np).resize((orig_w, orig_h))
+            # 5. Decode
+            decoded = self.vae.decode(latents / self.vae_scaling).sample
+            decoded = (decoded / 2.0 + 0.5).clamp(0.0, 1.0)
+            decoded_np = (
+                decoded.detach().squeeze(0).permute(1, 2, 0).float().cpu().numpy() * 255.0
+            ).astype(np.uint8)
+            decoded_pil = Image.fromarray(decoded_np)
 
-            # 7. Ghép pixel chính xác 100% ngoài vùng mask
-            final_img = Image.composite(decoded_pil, normal_image, defect_mask)
-            return final_img
+            if (work_w, work_h) != (orig_w, orig_h):
+                decoded_pil = decoded_pil.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
 
-        # ── FALLBACK CHO MÔI TRƯỜNG CHƯA TẢI TRỌNG SỐ ─────────────────────
-        logger.info(f"[Inpainting Fallback] Đang mô phỏng defect '{defect_type}' trên mask...")
+            # 6. Feather + composite ở native resolution
+            sigma = self.feather_sigma
+            # Với ảnh rất lớn, tăng nhẹ bán kính feather theo tỷ lệ.
+            if max(orig_w, orig_h) > 800:
+                sigma = max(sigma, min(4.0, sigma * max(orig_w, orig_h) / 800.0))
+
+            orig_np = np.array(normal_image, dtype=np.uint8)
+            gen_np = np.array(decoded_pil.convert("RGB"), dtype=np.uint8)
+            alpha = self._feather_alpha(mask_np_orig, sigma=sigma, expand_px=4)
+            final_np = self._composite(orig_np, gen_np, alpha)
+
+            lora_file = self._resolve_checkpoint(
+                self.lora_ckpt, "pytorch_lora_weights.pt"
+            )
+            ti_file = self._resolve_checkpoint(self.ti_ckpt, "ti_embeddings.pt")
+            self._last_info = {
+                "generation_mode": "diffusion",
+                "generation_version": "ddim_consistent_v2",
+                "model_id": self.model_id,
+                "lora_checkpoint": str(lora_file.resolve()) if lora_file else None,
+                "ti_checkpoint": str(ti_file.resolve()) if ti_file else None,
+                "inpaint_steps": int(self.num_inference_steps),
+                "guidance_scale": float(self.guidance_scale),
+                "work_size": [int(work_w), int(work_h)],
+                "orig_size": [int(orig_w), int(orig_h)],
+                "feather_sigma": float(sigma),
+                "latent_overwrite": "consistent_single_noise_ddim",
+                "using_lora": bool(self.using_lora),
+                "ti_loaded": bool(self.ti_loaded),
+            }
+            return Image.fromarray(final_np)
+
+        # ── Fallback mô phỏng (chỉ khi allow_fallback=True) ────────────────
+        logger.warning(
+            f"[Inpainting Fallback] Mô phỏng defect '{defect_type}' trên mask. "
+            "Đây KHÔNG phải kết quả diffusion thật."
+        )
         orig_np = np.array(normal_image).copy()
-        mask_np = np.array(defect_mask)
-        m = (mask_np > 128)
+        m = mask_np_orig > 127
         if m.any():
             if defect_type in ["missing_hole", "open_circuit"]:
                 orig_np[m] = (orig_np[m] * 0.3).astype(np.uint8)
             elif defect_type in ["spur", "spurious_copper", "short"]:
                 orig_np[m] = np.clip(orig_np[m].astype(int) + 60, 0, 255).astype(np.uint8)
             else:
-                orig_np[m] = (255 - orig_np[m])
+                orig_np[m] = 255 - orig_np[m]
 
+        self._last_info = {
+            "generation_mode": "fallback_simulation",
+            "work_size": [int(orig_w), int(orig_h)],
+            "feather_sigma": 0.0,
+            "latent_overwrite": "none",
+            "using_lora": False,
+            "ti_loaded": False,
+        }
         return Image.fromarray(orig_np)
 
     def generate_batch(
@@ -959,16 +1308,57 @@ class PCBDefectInpainter:
         mask_records: List[Dict],
         output_dir: Union[str, Path] = "outputs/generated",
     ) -> List[Dict]:
-        """
-        Sinh batch toàn bộ ảnh lỗi dựa trên danh sách metadata từ Step 1 (CAMG).
-        """
+        """Sinh batch ảnh lỗi từ mask_metadata.json của Step 1."""
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"[Step 2] Bắt đầu sinh {len(mask_records)} ảnh lỗi tổng hợp...")
-        gen_records = []
+        gen_records: List[Dict] = []
+        failures = 0
 
-        for i, rec in enumerate(tqdm(mask_records, desc="Khuếch tán sinh ảnh lỗi (Inpainting)", unit="ảnh")):
+        # Resume chỉ được phép dùng lại ảnh nếu metadata cũ chứng minh ảnh đó
+        # thật sự được sinh bằng diffusion + LoRA + TI + latent overwrite nhất
+        # quán, đúng checkpoint và đúng prompt/steps. Nếu không, phải sinh lại.
+        current_lora = self._resolve_checkpoint(
+            self.lora_ckpt, "pytorch_lora_weights.pt"
+        )
+        current_ti = self._resolve_checkpoint(self.ti_ckpt, "ti_embeddings.pt")
+        current_lora = str(current_lora.resolve()) if current_lora else None
+        current_ti = str(current_ti.resolve()) if current_ti else None
+
+        cached_by_name: Dict[str, Dict] = {}
+        existing_meta = out_dir / "generated_metadata.json"
+        if existing_meta.exists():
+            try:
+                with open(existing_meta, "r", encoding="utf-8") as f:
+                    old_records = json.load(f)
+                for old in old_records:
+                    p = Path(old.get("synthetic_image_path", ""))
+                    if (
+                        p.exists()
+                        and old.get("generation_mode") == "diffusion"
+                        and old.get("generation_version") == "ddim_consistent_v2"
+                        and old.get("latent_overwrite") == "consistent_single_noise_ddim"
+                        and old.get("using_lora")
+                        and old.get("ti_loaded")
+                        and old.get("lora_checkpoint") == current_lora
+                        and old.get("ti_checkpoint") == current_ti
+                        and int(old.get("inpaint_steps", -1)) == int(self.num_inference_steps)
+                        and abs(float(old.get("guidance_scale", -1.0)) - float(self.guidance_scale)) < 1e-6
+                        and old.get("model_id") == self.model_id
+                    ):
+                        cached_by_name[p.name] = old
+            except Exception as e:
+                logger.warning(f"[Step 2] Không đọc được metadata cũ để resume: {e}")
+
+        def _file_sig(path: Union[str, Path]):
+            try:
+                st = Path(path).stat()
+                return int(st.st_size), int(st.st_mtime_ns)
+            except OSError:
+                return None
+
+        for i, rec in enumerate(tqdm(mask_records, desc="Khuếch tán sinh ảnh lỗi", unit="ảnh")):
             normal_img_path = rec["normal_image_path"]
             mask_path = rec["mask_path"]
             defect_type = rec["defect_type"]
@@ -977,25 +1367,70 @@ class PCBDefectInpainter:
             out_name = f"syn_{stem}_{defect_type}_{i:04d}.png"
             out_img_path = out_dir / out_name
 
-            # Bỏ qua nếu ảnh đã được sinh từ trước (hỗ trợ khôi phục tiến trình)
-            if not (out_img_path.exists() and out_img_path.stat().st_size > 1024):
-                gen_img = self.generate(
-                    normal_image=normal_img_path,
-                    defect_mask=mask_path,
-                    defect_type=defect_type,
-                )
-                gen_img.save(out_img_path)
+            try:
+                cached = cached_by_name.get(out_img_path.name)
+                normal_sig = _file_sig(normal_img_path)
+                mask_sig = _file_sig(mask_path)
+                if cached is not None:
+                    cached_normal_sig = (
+                        cached.get("source_normal_size"),
+                        cached.get("source_normal_mtime_ns"),
+                    )
+                    cached_mask_sig = (
+                        cached.get("mask_size"),
+                        cached.get("mask_mtime_ns"),
+                    )
+                    if (
+                        normal_sig is None
+                        or mask_sig is None
+                        or cached_normal_sig != normal_sig
+                        or cached_mask_sig != mask_sig
+                        or not out_img_path.exists()
+                        or out_img_path.stat().st_size <= 1024
+                    ):
+                        cached = None
+
+                if cached is not None:
+                    info = cached
+                else:
+                    gen_img = self.generate(
+                        normal_image=normal_img_path,
+                        defect_mask=mask_path,
+                        defect_type=defect_type,
+                    )
+                    gen_img.save(out_img_path)
+                    info = dict(self._last_info) if self._last_info else {}
+            except Exception as e:
+                failures += 1
+                logger.warning(f"[Step 2] Bỏ qua {normal_img_path} / {defect_type}: {e}")
+                continue
 
             gen_records.append({
                 "synthetic_image_path": str(out_img_path.resolve()),
                 "source_normal_image": normal_img_path,
                 "mask_path": mask_path,
+                "source_normal_size": normal_sig[0] if normal_sig else None,
+                "source_normal_mtime_ns": normal_sig[1] if normal_sig else None,
+                "mask_size": mask_sig[0] if mask_sig else None,
+                "mask_mtime_ns": mask_sig[1] if mask_sig else None,
                 "defect_type": defect_type,
                 "class_id": rec.get("class_id", 0),
                 "bbox_pixel": rec.get("bbox_pixel", []),
                 "bbox_norm": rec.get("bbox_norm", []),
                 "prompt": self.ti_manager.get_defect_prompt(defect_type),
                 "negative_prompt": self.negative_prompt,
+                "generation_mode": info.get("generation_mode", "unknown"),
+                "generation_version": info.get("generation_version", "unknown"),
+                "model_id": info.get("model_id", self.model_id),
+                "lora_checkpoint": info.get("lora_checkpoint", current_lora),
+                "ti_checkpoint": info.get("ti_checkpoint", current_ti),
+                "inpaint_steps": info.get("inpaint_steps", self.num_inference_steps),
+                "guidance_scale": info.get("guidance_scale", self.guidance_scale),
+                "work_size": info.get("work_size", []),
+                "feather_sigma": info.get("feather_sigma", self.feather_sigma),
+                "latent_overwrite": info.get("latent_overwrite", "unknown"),
+                "using_lora": info.get("using_lora", self.using_lora),
+                "ti_loaded": info.get("ti_loaded", self.ti_loaded),
             })
 
         meta_out = out_dir / "generated_metadata.json"
@@ -1003,10 +1438,16 @@ class PCBDefectInpainter:
             json.dump(gen_records, f, indent=2, ensure_ascii=False)
 
         logger.info(f"Step 2 xong! Đã tạo {len(gen_records)} ảnh. Metadata: {meta_out}")
+        if failures:
+            logger.warning(f"Đã bỏ qua {failures}/{len(mask_records)} mẫu do lỗi sinh ảnh.")
         return gen_records
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    inpainter = PCBDefectInpainter()
-    logger.info("Step 2 Module (Diffusion Training Loop + Latent Overwriting) đã nạp thành công.")
+    print(
+        "Step 2 module đã sẵn sàng. Dùng:\n"
+        "  python run_pipeline.py step2_train --metadata_path data/train_metadata.json\n"
+        "  python run_pipeline.py step2_generate --mask_meta outputs/pcb_synthesis/masks/mask_metadata.json "
+        "--lora_ckpt outputs/pcb_synthesis/lora_checkpoints/epoch_010"
+    )

@@ -1,8 +1,9 @@
 # New Product Introduction (NPI) Dataset Config
-# Train trên Seen Products, Val trên 100% Unseen Products
-path: .
-train: data/prepared_splits/npi_train_low.txt
-val: data/prepared_splits/npi_val_unseen.txt
+# split_protocol: official_train_only_v2
+# Train trên seen boards; val trên official val+test của unseen boards.
+path: C:/Users/Lenovo/Downloads/diffusion/diffusion/data
+train: C:/Users/Lenovo/Downloads/diffusion/diffusion/data/prepared_splits/npi_train_low.txt
+val: C:/Users/Lenovo/Downloads/diffusion/diffusion/data/prepared_splits/npi_val_unseen.txt
 
 nc: 6
 names: ['mouse_bite', 'spur', 'missing_hole', 'short', 'open_circuit', 'spurious_copper']

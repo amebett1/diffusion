@@ -1,54 +1,117 @@
-# PCB Defect Image Synthesis & Quality Filter Pipeline
+# PCB Defect Synthesis & Detection Pipeline
 
-Triển khai hoàn chỉnh theo bài báo khoa học:
-> **"A Synthetic Defect Image Generation Method for Enhanced Industrial Defect Detection Based on Inpainting Diffusion and Context-aware Mask Generation"**  
-> *Journal of Intelligent Manufacturing (POSTECH, 2026)*
+Pipeline 4 giai đoạn theo hướng tiếp cận của bài báo:
 
----
+> **A Synthetic Defect Image Generation Method for Enhanced Industrial Defect Detection Based on Inpainting Diffusion and Context-aware Mask Generation**
 
-## Kiến trúc 4 bước cốt lõi của Pipeline
-
-1. **Step 1 — Context-Aware Mask Generation (CAMG)**:
-   - Backbone **DINOv2 ViT-B/14** (Frozen feature extractor).
-   - Dự đoán phân loại patch-wise (7 classes) và kích thước bounding box ($\log w, \log h$).
-   - Cơ chế lấy mẫu **Top-k Sampling (k = 5)** xác định vị trí khuyết tật tự nhiên nhất trên bề mặt bo mạch.
-
-2. **Step 2 — Inpainting Diffusion + LoRA + Textual Inversion**:
-   - Kiến trúc **Stable Diffusion Inpainting** (U-Net 9 kênh).
-   - Parameter-Efficient Fine-Tuning: **LoRA ($r=8, \alpha=16$)** cho Attention và Output projections.
-   - **6 tokens học riêng biệt** qua Textual Inversion cho 6 loại lỗi PCB (`<pcb_mouse_bite>`, v.v.).
-   - Hàm mất mát kép **Dual-Loss** ($\mathcal{L}_{\text{tot}} = \mathcal{L}_{\text{def}} + \lambda \mathcal{L}_{\text{rec}}$, $\lambda = 0.1$).
-   - 50 bước DDIM Scheduler kết hợp cơ chế **Latent Overwriting** bảo toàn 100% cấu trúc bo mạch nền sạch.
-
-3. **Step 3 — Confidence-based Quality Filtering (YOLO11s Judge)**:
-   - Huấn luyện mô hình phát hiện **YOLO11s** (100 epochs, AdamW optimizer, cosine lr scheduling).
-   - Chấm điểm chất lượng đối chiếu mục tiêu (**Target-aware IoU matching $\ge 0.1$**).
-   - Quy tắc lọc chất lượng: **Loại bỏ 25%** ảnh confidence thấp nhất, giữ lại 75% ảnh đạt chuẩn.
-   - Tự động xuất nhãn bounding box chuẩn YOLO (`.txt`) và file cấu hình `augmented_dataset.yaml`.
-
-4. **Step 4 — Downstream Benchmark Module**:
-   - Đánh giá đối chứng trên 4 kiến trúc phát hiện khuyết tật: **YOLOv8s, YOLOv9s, YOLO11s, RT-DETR-l**.
-   - Tái lập 2 bảng thực nghiệm cốt lõi của bài báo:
-     - **Table 3 — In-Distribution (ID)**: 10% Low-Data thực tế vs Tập dữ liệu mở rộng.
-     - **Table 6 — New Product Introduction (NPI)**: Đánh giá khả năng tổng quát hóa trên bo mạch mới (*Unseen Boards 10, 11, 12*).
-   - Đo lường bộ ba chỉ số chuẩn mực: **Precision, Recall, mAP@50** (với ngưỡng đánh giá cố định: $\text{conf}=0.25, \text{IoU}=0.25$).
-   - Chứng minh mức tăng vọt về **Recall** (lên tới **+21.5 điểm phần trăm**) giúp triệt tiêu hiện tượng bỏ sót lỗi trong sản xuất công nghiệp.
+Repo này là bản **resource-limited**, chạy được trên một GPU nhỏ. Không tuyên bố tái lập đầy đủ 5 mô hình hay toàn bộ bảng số của paper.
 
 ---
 
-## Hướng dẫn cài đặt & Thiết lập dữ liệu
+## 0. Chạy trên Kaggle bằng Save & Run All (khuyến nghị)
 
-### 1. Clone mã nguồn (Siêu nhẹ < 2 MB)
-```bash
-git clone https://github.com/amebett1/diffusion.git
-cd diffusion
-pip install -r requirements.txt
+Không cần chạy trên máy cá nhân. Trên Windows, tạo code zip:
+
+```powershell
+python package_for_kaggle.py
 ```
 
-### 2. Thiết lập dữ liệu (`data/`)
-Dự án sử dụng tập dữ liệu **DeepPCB (PCB Defect Dataset)**. Người dùng tự tải tập dữ liệu theo đường link được cung cấp:
+Sau đó trên Kaggle:
 
-1. **Tải & Giải nén:** Tải file nén dataset và giải nén vào thư mục `data/pcb-defect-dataset/` sao cho cấu trúc như sau:
+1. Upload `diffusion_kaggle_code.zip` thành Dataset tên `diffusion-code`.
+2. Upload `data/pcb-defect-dataset/` thành Dataset tên `pcb-defect-dataset`.
+3. Mở `run_on_kaggle.ipynb`, **Add Input** cả hai dataset.
+4. Bật **Internet** và chọn **GPU** (T4/P100).
+5. **Save Version -> Save & Run All (Commit)**.
+
+Notebook sẽ tự giải nén code zip vào `/kaggle/working/diffusion`, tải model, chạy
+pipeline và lưu output. Có thể tắt máy sau khi Save; Kaggle chạy trên máy chủ.
+
+Profile mặc định của notebook Kaggle là **resource-limited**, không phải full paper:
+CAMG 10 epochs, LoRA 2 epochs, 400 ảnh synthetic, YOLO judge 50 epochs,
+benchmark 50 epochs. Step 2 lưu checkpoint sau mỗi epoch và hỗ trợ `--resume`.
+
+Xem hướng dẫn chi tiết, giới hạn thời gian và cách resume tại
+[`KAGGLE_SETUP.md`](KAGGLE_SETUP.md).
+
+---
+
+## 1. Phạm vi thực tế của repo
+
+- Chỉ benchmark **YOLO11s**. Các mô hình YOLOv8, YOLOv9, RT-DETR bị bỏ qua có chủ đích.
+- Dataset local chỉ có **7 seen boards**: `01, 04, 05, 06, 07, 08, 09`.
+  - Board `02, 03` không có trong dữ liệu đang dùng.
+  - Unseen boards: `10, 11, 12`.
+- Step 3 mặc định dùng YOLO11s judge. Nếu không có GPU/weights, code có thể chuyển sang heuristic Sobel/contrast; chế độ này được ghi rõ trong `pipeline_report.json` và **không được gọi là YOLO judge**.
+- Kết quả benchmark phải được đọc theo đúng protocol:
+  - `conf = 0.25`
+  - NMS IoU = `0.7`
+  - evaluate checkpoint `best.pt` được reload từ đĩa
+  - Ultralytics dùng match IoU mặc định `0.5`; paper dùng match IoU `0.25`. Sai khác này được ghi trong báo cáo, không gán nhãn sai là NMS IoU.
+
+---
+
+## 2. Trạng thái setup hiện tại
+
+Đã kiểm tra trên máy Windows hiện tại:
+
+| Thành phần | Trạng thái |
+|---|---|
+| Python | 3.13.5 |
+| PyTorch | 2.6.0 + CUDA 12.4 |
+| GPU | RTX 4050 Laptop, 6 GB VRAM |
+| diffusers | 0.41.0 |
+| transformers | 5.7.0 |
+| accelerate | 1.15.0 |
+| Stable Diffusion Inpainting fp16 | đã cache |
+| DINOv2 ViT-B/14 | đã cache |
+| YOLO11s weights | có `yolo11s.pt` |
+| Data prep | hợp lệ, 799 normals |
+| CAMG production checkpoint | chưa có (sẽ train) |
+| LoRA/TI production checkpoint | chưa có (sẽ train) |
+| Benchmark thật | chưa chạy |
+
+Chạy kiểm tra lại bất cứ lúc nào:
+
+```bash
+python verify_setup.py
+```
+
+Nếu cache model còn thiếu:
+
+```bash
+python verify_setup.py --download-models
+```
+
+---
+
+## 3. Cài đặt
+
+Khuyến nghị Python 3.10–3.13, có GPU NVIDIA và CUDA tương thích PyTorch.
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Nếu máy chưa có PyTorch CUDA, cài theo hướng dẫn chính thức của PyTorch trước, sau đó cài phần còn lại:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Các package chính:
+
+- `torch`, `torchvision`
+- `diffusers`, `transformers`, `accelerate`, `safetensors`
+- `ultralytics`
+- `opencv-python`, `Pillow`, `numpy`, `tqdm`, `PyYAML`
+
+---
+
+## 4. Dữ liệu
+
+Cấu trúc bắt buộc:
+
 ```text
 data/
 └── pcb-defect-dataset/
@@ -63,186 +126,403 @@ data/
         └── labels/
 ```
 
-2. **Chạy tiền xử lý dữ liệu tự động (Tạo ID/NPI splits & sinh 799 ảnh phôi sạch `pcb_normal/`):**
+Tạo split và 799 ảnh phôi sạch:
+
 ```bash
 python run_pipeline.py prepare_data
-# Hoặc chạy: python pcb_pipeline/data_module.py && python setup_env_paths.py
 ```
 
-> **Cơ chế tự động hóa:** Lệnh trên chỉ mất vài giây để:
-> - Phân chia kịch bản **In-Distribution (ID - 10% Low-Data)** và **New Product Introduction (NPI - Unseen Boards)** theo đúng bài báo.
-> - Tính toán thống kê kích thước Bounding Box ($Q_1, Q_3$) cho loss function.
-> - Tự động áp dụng thuật toán Telea Inpainting để xóa sạch khuyết tật trên các bo mạch đại diện, tạo ra **799 ảnh phôi sạch chuẩn 600x600** trong thư mục `data/pcb_normal/`.
-> - Chuẩn hóa toàn bộ đường dẫn tương đối để chạy được ngay trên bất kỳ máy tính nào (Windows, Linux, Colab) mà không bao giờ bị lỗi đường dẫn!
+Nếu muốn tạo lại từ đầu:
+
+```bash
+python run_pipeline.py prepare_data --force
+```
+
+Kết quả hiện tại:
+
+| Artifact | Số lượng |
+|---|---:|
+| ID train full | 5,339 |
+| ID train low (10%) | 534 |
+| ID val | 941 |
+| NPI unseen val | 550 |
+| PCB normal | 799 |
+| Normal bằng clean crop | 163 |
+| Normal bằng Telea đã verify | 636 |
+| Telea bị reject | 336 |
+
+Quy tắc chống leakage:
+
+- ID train/val chỉ lấy từ **official train** của seen boards.
+- NPI val chỉ lấy từ **official val/test** của unseen boards `10/11/12`.
+- Không đưa ảnh unseen boards vào ID generation.
+- NPI train dùng seen boards, không dùng unseen boards để train.
+
+Kiểm tra nhanh:
+
+```bash
+python verify_setup.py
+```
 
 ---
 
-## Cách chạy Pipeline
+## 5. Chạy pipeline
 
-### Cách 1: Chạy trên Kaggle với GPU 2x T4 (Khuyên dùng nhất — Có thể tắt máy tính)
+### 5.1. Chạy một lần toàn bộ
 
-Dự án tích hợp sẵn notebook [`run_on_kaggle.ipynb`](run_on_kaggle.ipynb) được tối ưu hóa cho môi trường Kaggle với **GPU 2x T4 (Dual GPU - 30GB VRAM)**.
-
-#### 💡 Tại sao nên chọn Kaggle thay vì Google Colab?
-- **Tắt máy tính hoàn toàn khi train**: Google Colab bắt buộc phải giữ tab trình duyệt luôn mở (`on-screen`). Với Kaggle, bạn chỉ cần bấm **`Save Version`** $\rightarrow$ chọn **`Save & Run All (Commit)`** $\rightarrow$ **tắt máy tính đi ngủ**! Máy chủ Kaggle sẽ chạy ngầm toàn bộ pipeline (tối đa 9–12 giờ) và tự động lưu toàn bộ trọng số, ảnh sinh và báo cáo đối chuẩn.
-- **Tài nguyên GPU 2x T4**: Cung cấp miễn phí 30 giờ/tuần với cấu hình Dual GPU T4 x2 (30GB VRAM) hoặc P100 (16GB VRAM).
-- **Cơ chế tự động khôi phục (`--resume`)**: Nếu phiên chạy bị gián đoạn, pipeline tự động nhận diện các giai đoạn đã hoàn tất và tiếp tục chính xác công đoạn đang dang dở.
-
-#### Các bước thực hiện trên Kaggle:
-1. **Tạo Notebook mới trên Kaggle**:
-   - Truy cập [Kaggle Kernels](https://www.kaggle.com/code) $\rightarrow$ Chọn **New Notebook**.
-   - Bấm **File** $\rightarrow$ **Import Notebook** $\rightarrow$ Tải lên file [`run_on_kaggle.ipynb`](run_on_kaggle.ipynb) từ repo.
-2. **Cấu hình Accelerator GPU 2x T4 (Menu Settings bên phải)**:
-   - **Accelerator**: Chọn **GPU T4 x2** (hoặc GPU P100).
-   - **Internet**: Bật **On** (để clone mã nguồn và tải pretrained models).
-   - **Persistence**: Chọn **Files only**.
-3. **Chạy ngầm toàn bộ (One-Click Background Run)**:
-   - Bấm nút **`Save Version`** ở góc trên cùng bên phải.
-   - Chọn **`Save & Run All (Commit)`** $\rightarrow$ Bấm **Save**.
-   - **Bạn có thể đóng trình duyệt và tắt máy tính!** Sau khi hoàn tất, kết quả sẽ sẵn sàng để tải về trong tab *Output*.
-
----
-
-### Cách 2: Chạy trực tiếp trên Google Colab với GPU T4
-
-Nếu bạn muốn chạy trên Google Colab, sử dụng notebook [`run_on_colab.ipynb`](run_on_colab.ipynb):
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/amebett1/diffusion/blob/main/run_on_colab.ipynb)
-
-> **Lưu ý**: Khi chạy trên Colab, bạn cần giữ tab trình duyệt hoạt động trong suốt quá trình chạy.
-
----
-
-### Cách 3: Chạy toàn bộ Pipeline bằng Command Line (One-Click Full & Resume)
-Chạy toàn bộ quá trình sinh ảnh và tự động benchmark, tự động ghi nhận checkpoint và khôi phục khi cần:
 ```bash
 python run_pipeline.py full \
-    --image_dir data/pcb_normal \
-    --real_defect_dir data/pcb-defect-dataset/train/images \
-    --metadata_path data/train_metadata.json \
-    --data_yaml data/id_setup.yaml \
     --output_dir outputs/pcb_synthesis \
-    --lora_epochs 10 \
-    --lora_batch 32 \
-    --inpaint_steps 50 \
-    --guidance 7.5 \
-    --yolo_size s \
-    --yolo_epochs 100 \
-    --reject_ratio 0.25 \
     --run_benchmark \
-    --benchmark_models yolo11 \
-    --benchmark_epochs 100 \
     --resume \
     --device cuda
 ```
 
-Kiểm tra bảng trạng thái tiến trình của pipeline bất kỳ lúc nào:
+Profile nhanh cho Kaggle commit (không phải full paper):
+
+```bash
+python run_pipeline.py full \
+    --output_dir outputs/pcb_synthesis \
+    --camg_epochs 10 \
+    --lora_epochs 2 \
+    --num_samples 400 \
+    --yolo_epochs 50 \
+    --benchmark_models yolo11s \
+    --benchmark_epochs 50 \
+    --run_benchmark \
+    --resume \
+    --device cuda
+```
+
+Pipeline sẽ tự:
+
+1. Kiểm tra/tạo data prep.
+2. Train CAMG nếu chưa có `camg_best.pth` production.
+3. Sinh mask.
+4. Train LoRA + TI nếu chưa có checkpoint.
+5. Sinh ảnh diffusion.
+6. Lọc chất lượng bằng YOLO11s judge.
+7. Benchmark YOLO11s baseline vs augmented nếu có `--run_benchmark`.
+
+Xem trạng thái:
+
 ```bash
 python run_pipeline.py status --output_dir outputs/pcb_synthesis
 ```
 
-### Cách 4: Chạy từng bước độc lập (Modular CLI Execution)
+Chạy lại từ một stage:
 
-Bạn có thể chạy riêng lẻ từng công đoạn hoặc dùng cờ `--from_stage` / `--to_stage` trong lệnh `python run_pipeline.py full --from_stage 2b --to_stage 3`:
+```bash
+python run_pipeline.py full --from_stage 2b --to_stage 3 --resume
+```
 
-#### Bước 1: Sinh Mask bằng CAMG (Context-Aware Mask Generation)
+`--from_stage` / `--to_stage` nhận: `0, 1, 2a, 2b, 3, 4`.
+
+> `--resume` chỉ dùng cache nếu metadata chứng minh đúng generation version, đúng LoRA/TI checkpoint, đúng số bước DDIM và đúng guidance scale. Artifact cũ không đạt các điều kiện này sẽ bị bỏ qua hoặc archive.
+
+---
+
+### 5.2. Chạy từng giai đoạn
+
+#### Step 0 — Data prep
+
+```bash
+python run_pipeline.py prepare_data
+```
+
+#### Step 1 — Train CAMG
+
+```bash
+python run_pipeline.py step1_train \
+    --metadata_path data/train_metadata.json \
+    --camg_epochs 10 \
+    --camg_batch 32 \
+    --camg_lr 1e-4 \
+    --device cuda
+```
+
+Checkpoint mặc định:
+
+```text
+outputs/pcb_synthesis/camg_checkpoints/camg_best.pth
+```
+
+Smoke test rất nhanh (không phải model production):
+
+```bash
+python run_pipeline.py step1_train \
+    --metadata_path scratch/camg_smoke/train_metadata_small.json \
+    --camg_epochs 1 \
+    --camg_batch 8 \
+    --camg_out scratch/camg_smoke/checkpoints
+```
+
+#### Step 1 — Sinh mask
+
 ```bash
 python run_pipeline.py step1 \
     --image_dir data/pcb_normal \
-    --output_dir outputs \
+    --output_dir outputs/pcb_synthesis \
     --k 5 \
     --images_per_defect 1
 ```
 
-#### Bước 2a: Huấn luyện LoRA + Textual Inversion
+Mask hợp lệ phải:
+
+- nằm trong foreground PCB,
+- không rơi vào mounting hole,
+- không sát viền,
+- có kích thước gần phân bố thật (W Q1/median/Q3 ≈ 21/27/36 px).
+
+Nếu muốn sinh lại mask:
+
+```bash
+python run_pipeline.py step1 --force_masks
+```
+
+#### Step 2a — Train LoRA + Textual Inversion
+
 ```bash
 python run_pipeline.py step2_train \
     --metadata_path data/train_metadata.json \
-    --output_dir outputs \
-    --lora_epochs 10 \
+    --lora_rank 8 \
+    --lora_alpha 16 \
+    --lora_epochs 2 \
     --lora_batch 32 \
     --device cuda
 ```
 
-#### Bước 2b: Sinh ảnh khuyết tật tổng hợp (SD Inpainting + Latent Overwriting)
+`2` là profile Kaggle; tăng nếu chạy local/đủ thời gian.
+
+Lưu ý:
+
+- `--lora_batch` là **gradient accumulation**, không phải batch vật lý. Batch vật lý luôn là 1 để phù hợp GPU 6 GB.
+- Code tự dùng fp16 + attention slicing + gradient checkpointing trên CUDA.
+- Checkpoint được lưu **sau mỗi epoch**, ví dụ với profile Kaggle 2 epochs:
+
+```text
+outputs/pcb_synthesis/lora_checkpoints/
+├── epoch_001/
+│   ├── pytorch_lora_weights.pt
+│   ├── ti_embeddings.pt
+│   ├── optimizer.pt
+│   └── scaler.pt
+├── epoch_002/
+│   └── ...
+└── training_state.json
+```
+
+`training_state.json` ghi số epoch đã hoàn tất. Nếu checkpoint mới có một phần,
+lần chạy sau với `--resume` sẽ tự resume từ epoch đã lưu thay vì bỏ qua train.
+Nếu checkpoint đã đủ số epoch, pipeline bỏ qua train. Muốn train lại từ đầu:
+
+```bash
+python run_pipeline.py step2_train --force_lora
+```
+
+#### Step 2b — Sinh ảnh lỗi
+
 ```bash
 python run_pipeline.py step2_generate \
-    --mask_meta outputs/masks/mask_metadata.json \
-    --lora_ckpt outputs/lora_checkpoints/epoch_010 \
-    --output_dir outputs \
+    --mask_meta outputs/pcb_synthesis/masks/mask_metadata.json \
+    --output_dir outputs/pcb_synthesis \
+    --num_samples 400 \
     --inpaint_steps 50 \
+    --guidance 7.5 \
     --device cuda
 ```
 
-#### Bước 3: Huấn luyện YOLO11 Judge & Lọc chất lượng (Top 75%)
+`400` là profile Kaggle; local full có thể dùng `--num_samples 829` nếu đủ thời gian.
+Code tự tìm checkpoint LoRA mới nhất; không cần hardcode tên `epoch_*`.
+
+Code sẽ:
+
+- dùng một noise schedule DDIM nhất quán,
+- giữ background theo `z0` + noise cố định,
+- feather biên mask 2–3 px,
+- composite ở native resolution để giữ micro-trace.
+
+#### Step 3 — Lọc chất lượng
+
 ```bash
 python run_pipeline.py step3 \
-    --gen_meta outputs/generated/generated_metadata.json \
+    --gen_meta outputs/pcb_synthesis/generated/generated_metadata.json \
+    --output_dir outputs/pcb_synthesis \
     --data_yaml data/id_setup.yaml \
-    --output_dir outputs \
     --yolo_size s \
-    --yolo_epochs 100 \
+    --yolo_epochs 50 \
     --reject_ratio 0.25 \
     --device cuda
 ```
 
-#### Bước 4: Downstream Benchmark (Tái lập Table 3 & Table 6 của Bài Báo)
-Huấn luyện và đánh giá đối chứng mô hình (mặc định chạy 1 mô hình `yolo11` để tối ưu thời gian GPU):
+Nếu chưa có YOLO judge weights, Step 3 sẽ train YOLO11s judge trên real low-data. Nếu không dùng được YOLO/GPU, code có thể fallback heuristic; kiểm tra `pipeline_report.json` để biết chế độ thực tế.
+
+Kết quả:
+
+```text
+outputs/pcb_synthesis/filtered/
+├── accepted/
+├── rejected/
+├── accepted_metadata.json
+├── rejected_metadata.json
+└── augmented_dataset.yaml
+```
+
+#### Step 4 — Benchmark YOLO11s
+
 ```bash
 python run_pipeline.py step4 \
-    --models yolo11 \
+    --models yolo11s \
     --split id \
     --base_yaml data/id_setup.yaml \
     --aug_yaml outputs/pcb_synthesis/filtered/augmented_dataset.yaml \
-    --epochs 100 \
+    --output_dir outputs/pcb_synthesis \
+    --epochs 50 \
     --batch_size 8 \
-    --lr0 1e-4 \
     --conf 0.25 \
-    --iou 0.25 \
-    --output_dir outputs/benchmark \
+    --iou 0.7 \
+    --imgsz 600 \
     --device cuda
 ```
 
-> **Ghi chú về tham số Step 4 chuẩn bài báo (Trang 8, Cột 2):**
-> - `--models yolo11`: Mặc định chỉ chạy 1 mô hình (`yolo11`) để tiết kiệm thời gian (khoảng 40-50 phút trên Colab T4). Nếu muốn chạy đầy đủ 4 mô hình đối chứng theo bài báo, bạn có thể truyền: `--models yolo11 yolov8 yolov9 rtdetr`.
-> - `--epochs 100`: Huấn luyện 100 epochs với optimizer AdamW và cosine learning rate decay.
-> - `--batch_size 8` & `--lr0 1e-4`: Tốc độ học $10^{-4}$ và kích thước batch 8 chuẩn bài báo.
-> - `--conf 0.25` & `--iou 0.25`: Ngưỡng đánh giá cố định để đo lường Precision và Recall.
-> - Tự động áp dụng các phép tăng cường: xoay ngẫu nhiên (`degrees=10.0`), lật ảnh (`flip`), và biến đổi màu (`HSV`).
+Chỉ `yolo11` / `yolo11s` được chấp nhận; các model khác bị log là skipped.
 
----
-
-## Cấu trúc Thư mục Kết quả Đầu ra (`outputs/`)
+Báo cáo:
 
 ```text
-outputs/
-├── pcb_synthesis/
-│   ├── masks/                         # Binary masks từ Step 1
-│   │   └── mask_metadata.json
-│   ├── generated/                     # Ảnh khuyết tật tổng hợp từ Step 2
-│   │   └── generated_metadata.json
-│   ├── filtered/                      # Kết quả chọn lọc chất lượng từ Step 3
-│   │   ├── accepted/                  # 75% ảnh đạt chuẩn chất lượng cao
-│   │   ├── labels/                    # Nhãn bounding box chuẩn YOLO (.txt)
-│   │   ├── accepted_metadata.json
-│   │   ├── rejected_metadata.json
-│   │   └── augmented_dataset.yaml     # File dataset mở rộng dùng cho Step 4
-│   ├── lora_checkpoints/              # Trọng số LoRA và Textual Inversion
-│   └── pipeline_report.json           # Báo cáo tổng kết quá trình sinh ảnh
-└── benchmark/                         # Kết quả đánh giá đối chứng từ Step 4
-    ├── benchmark_report.md            # Bảng báo cáo đối chứng Markdown (Table 3 / Table 6)
-    ├── benchmark_comparison.csv       # File bảng biểu CSV chi tiết (P, R, mAP50, per-class)
-    ├── benchmark_summary.json         # Dữ liệu số liệu JSON có cấu trúc
-    └── runs/                          # Checkpoints tốt nhất (best.pt) của từng mô hình
+outputs/pcb_synthesis/benchmark/
+├── benchmark_summary.json
+├── benchmark_comparison.csv
+└── benchmark_report.md
 ```
+
+Kết luận trong báo cáo được sinh theo delta thực tế: tăng, giảm hoặc gần như không đổi. Không có câu kết luận tích cực hardcode.
 
 ---
 
-## 6 loại lỗi PCB chuẩn DeepPCB (Paper Standard)
+## 6. Tài nguyên và thời gian chạy
 
-1. `mouse_bite` (Vết cắn góc viền)
-2. `spur` (Gờ lồi kim loại / via kim)
-3. `missing_hole` (Thiếu lỗ khoan via)
-4. `short` (Đoản mạch / ngắn mạch)
-5. `open_circuit` (Đứt đường dẫn mạch)
-6. `spurious_copper` (Đồng thừa / ba via đồng)
+Máy local là RTX 4050 Laptop 6 GB:
+
+- Step 1 CAMG: khoảng vài chục phút cho 10 epochs.
+- Step 1 sinh 4,794 masks: khoảng vài chục phút.
+- Step 2a LoRA 1 epoch trên 5,339 ảnh: khoảng 3 giờ trên GPU 6 GB.
+- Step 2b 400 ảnh × 50 DDIM steps: khoảng vài chục phút.
+- Step 3 judge 50 epochs + Step 4 benchmark 2 × 50 epochs: vài giờ.
+
+Profile Kaggle (T4/P100) thường mất khoảng **6–9 giờ** cho toàn bộ pipeline,
+tùy tốc độ GPU và việc model/dataset đã có cache hay chưa. Đây là ước tính, không
+phải cam kết thời gian chạy.
+
+Nếu chỉ muốn kiểm tra code end-to-end, dùng smoke test trước:
+
+```bash
+# CAMG smoke
+python run_pipeline.py step1_train \
+    --metadata_path scratch/camg_smoke/train_metadata_small.json \
+    --camg_epochs 1 \
+    --camg_out scratch/camg_smoke/checkpoints
+
+# LoRA smoke (2 ảnh)
+python run_pipeline.py step2_train \
+    --metadata_path scratch/lora_smoke/train_metadata_small.json \
+    --lora_epochs 1 \
+    --lora_batch 1 \
+    --output_dir scratch/lora_smoke/pipeline
+```
+
+> Smoke checkpoint chỉ để test code, không dùng cho benchmark.
+
+---
+
+## 7. Kiểm tra setup
+
+```bash
+python verify_setup.py
+```
+
+Script kiểm tra:
+
+- package và CUDA/VRAM,
+- 799 ảnh normal,
+- split counts và leakage cơ bản,
+- cache Stable Diffusion Inpainting fp16,
+- cache DINOv2,
+- YOLO11s weights,
+- output active có mask của unseen boards hay không.
+
+Nếu có lỗi, script in lệnh cần chạy để sửa.
+
+---
+
+## 8. Lưu ý về artifact cũ
+
+Artifact cũ không hợp lệ đã được archive tại:
+
+```text
+outputs/_stale_invalid_pcb_synthesis_20261022/
+```
+
+Không dùng thư mục này cho benchmark. `outputs/pcb_synthesis/` hiện là output active.
+
+Các lỗi cũ đã được loại bỏ:
+
+- mask sinh ngoài foreground / vào mounting hole,
+- mask quá lớn do cap `0.02–0.20`,
+- dùng unseen boards trong ID generation,
+- lẫn official val/test vào ID train,
+- Step 2 dùng noise Gaussian mới ở mỗi bước,
+- Step 4 đánh giá model trong RAM thay vì reload `best.pt`,
+- dùng IoU 0.25 như NMS IoU,
+- kết luận benchmark hardcode.
+
+---
+
+## 9. Troubleshooting
+
+### `ModuleNotFoundError: diffusers`
+
+```bash
+python -m pip install "diffusers>=0.31.0" accelerate safetensors
+```
+
+### CUDA out of memory ở Step 2
+
+- Đóng ứng dụng khác đang dùng GPU.
+- Giữ `--lora_batch` làm gradient accumulation, không tăng batch vật lý.
+- Thử `--num_samples` nhỏ hơn ở Step 2b.
+- Chạy trên Colab/Kaggle nếu 6 GB không đủ.
+
+### Không tìm thấy checkpoint
+
+```bash
+python run_pipeline.py status --output_dir outputs/pcb_synthesis
+```
+
+Pipeline `full` sẽ tự train nếu checkpoint production chưa có.
+
+### Muốn kiểm tra lại data prep
+
+```bash
+python setup_env_paths.py
+```
+
+Script này chỉ kiểm tra, **không sửa đường dẫn**.
+
+---
+
+## 10. Cấu trúc thư mục chính
+
+```text
+pcb_pipeline/
+├── data_module.py             # split, normal generation, stats
+├── step1_mask_generator.py    # CAMG train + mask generation
+├── step2_lora_inpainting.py   # LoRA/TI train + DDIM inpainting
+├── step3_quality_filter.py    # YOLO11s judge + augmented YAML
+└── step4_benchmark.py         # YOLO11s benchmark + report
+
+run_pipeline.py                # CLI/orchestrator
+verify_setup.py                # kiểm tra môi trường
+setup_env_paths.py             # compatibility check, không sửa path
+requirements.txt
+```

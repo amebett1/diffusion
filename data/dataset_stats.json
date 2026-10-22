@@ -1,39 +1,44 @@
 {
-  "total_instances": 21664,
+  "total_instances": 10006,
+  "source_split": "id_train_full",
+  "reference_image_size": 600,
+  "split_protocol": "official_train_only_v2",
   "class_distribution": {
-    "missing_hole": 3612,
-    "mouse_bite": 3684,
-    "open_circuit": 3548,
-    "short": 3508,
-    "spur": 3636,
-    "spurious_copper": 3676
+    "missing_hole": 1592,
+    "mouse_bite": 1648,
+    "open_circuit": 1637,
+    "short": 1603,
+    "spur": 1734,
+    "spurious_copper": 1792
   },
   "pixel_size": {
     "width": {
-      "mean": 30.30721196454948,
+      "mean": 29.779464321407158,
       "min": 9.0,
-      "q1": 21.96,
-      "median": 27.96,
+      "q1": 21.000000000000004,
+      "median": 27.0,
       "q3": 36.0,
-      "max": 118.02000000000001
+      "max": 114.0
     },
     "height": {
-      "mean": 30.298097304283605,
+      "mean": 29.72179692184689,
       "min": 7.9799999999999995,
       "q1": 21.000000000000004,
-      "median": 27.96,
-      "q3": 36.0,
-      "max": 118.98
+      "median": 27.0,
+      "q3": 34.98,
+      "max": 115.02000000000001
     }
   },
   "normalized_size": {
     "width": {
-      "q1": 0.0366,
+      "q1": 0.035,
+      "median": 0.045,
       "q3": 0.06
     },
     "height": {
       "q1": 0.035,
-      "q3": 0.06
+      "median": 0.045,
+      "q3": 0.0583
     }
   }
 }

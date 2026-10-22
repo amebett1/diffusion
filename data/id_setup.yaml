@@ -1,7 +1,9 @@
-# In-Distribution (ID) Dataset Config (10% Low-Data)
-path: .
-train: data/prepared_splits/id_train_low.txt
-val: data/prepared_splits/id_val.txt
+# In-Distribution (ID) Dataset Config
+# split_protocol: official_train_only_v2
+# Train/val chỉ lấy từ official train của seen boards.
+path: C:/Users/Lenovo/Downloads/diffusion/diffusion/data
+train: C:/Users/Lenovo/Downloads/diffusion/diffusion/data/prepared_splits/id_train_low.txt
+val: C:/Users/Lenovo/Downloads/diffusion/diffusion/data/prepared_splits/id_val.txt
 
 nc: 6
 names: ['mouse_bite', 'spur', 'missing_hole', 'short', 'open_circuit', 'spurious_copper']
